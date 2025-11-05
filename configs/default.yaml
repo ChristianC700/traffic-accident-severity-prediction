@@ -1,0 +1,59 @@
+# Paths
+raw_csv_path: "data/raw/US_Accidents_March23.csv"
+output_dir: "data/processed"
+reports_dir: "reports"
+
+# Columns
+target_column: "Severity"          # 1..4 classes
+id_columns: ["ID"]
+datetime_columns: ["Start_Time", "End_Time"]
+drop_columns: []                   # force-drop
+allowlist_only: false              # if true, keep only selected_features below
+
+# Feature selection (aligns with proposal)
+selected_features:
+  - Severity
+  - Start_Time
+  - End_Time
+  - Distance(mi)
+  - Start_Lat
+  - Start_Lng
+  - Weather_Condition
+  - Temperature(F)
+  - Visibility(mi)
+  - Wind_Speed(mph)
+  - Precipitation(in)
+  - Sunrise_Sunset
+  - Traffic_Signal
+  - Junction
+  - Crossing
+
+# Time feature engineering
+make_duration: true                # End_Time - Start_Time -> duration_min
+time_features:
+  hour: true
+  dow: true
+  month: true
+cyclical_encode: true              # sin/cos encoding
+
+# Missingness & filtering
+max_missing_col_fraction: 0.6
+drop_rows_with_missing_target: true
+
+# smaller sample to start
+sample_n_rows: 100000      # try 100k first; bump later
+sample_fraction: null
+
+
+# Split
+test_size: 0.15
+val_size: 0.15
+stratify: true
+
+# keep output sparse-friendly
+scale_numeric: false       # avoids dense scaling
+ohe_min_freq: 20           # bucket rare categories; reduces OHE width
+
+# IO/perf
+use_arrow: true
+n_jobs: -1

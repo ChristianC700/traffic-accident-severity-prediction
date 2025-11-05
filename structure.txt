@@ -1,0 +1,26 @@
+# traffic-accident-severity/ (workspace tree)
+.
+├─ configs/
+│  └─ default.yaml
+├─ data/
+│  ├─ raw/           # place US Accidents CSV here
+│  ├─ interim/       # optional temp artifacts
+│  └─ processed/     # outputs: parquet, y_*.csv, pipeline.joblib
+├─ notebooks/
+│  └─ .gitkeep
+├─ reports/
+│  └─ figures/       # confusion matrices, pipeline diagram later
+├─ scripts/
+│  └─ preprocess.py  # CLI entrypoint
+├─ src/
+│  └─ traffic_severity/
+│     ├─ __init__.py
+│     ├─ config.py
+│     ├─ preprocess.py
+│     └─ utils.py
+├─ tests/
+│  └─ .gitkeep
+├─ .gitignore
+├─ Makefile
+├─ README.md
+└─ requirements.txt

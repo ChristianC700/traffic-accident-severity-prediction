@@ -1,0 +1,9 @@
+# ---------- requirements.txt ----------
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+pyarrow>=15.0
+pydantic>=2.6
+PyYAML>=6.0
+kaggle>=1.6
+joblib>=1.3
