@@ -1,4 +1,4 @@
-.PHONY: setup preprocess clean fetch
+.PHONY: setup preprocess clean fetch baselines
 
 setup:
 	pip install -U pip && .\.venv\Scripts\python -m pip install -r requirements.txt
@@ -11,3 +11,6 @@ clean:
 
 fetch:
 	python scripts/fetch_kaggle.py
+
+baselines:
+	python models/baselines.py --meta data/processed/meta.json --reports_dir reports --config configs/default.yaml

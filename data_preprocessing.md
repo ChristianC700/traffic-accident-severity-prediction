@@ -233,10 +233,3 @@ features = json.loads((root/"features.json").read_text())["feature_names"]
   We **don’t** require activation. Commands call `.\.venv\Scripts\python` via Makefile’s `setup`.
 
 ---
-
-## 10) Next Steps
-
-* Add `models/baselines.py` to train Logistic Regression / LinearSVC / RandomForest on the saved artifacts and export a confusion matrix PNG to `reports/figures/`.
-* Generate a progress-report (LaTeX/Docx) skeleton with placeholders for EDA, pipeline figure, metrics, and next steps.
-
----

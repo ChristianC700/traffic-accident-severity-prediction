@@ -13,12 +13,19 @@ data/processed/
 *.parquet
 *.npz
 
-# Reports (keep folder, ignore generated files; keep placeholders)
+# Reports (keep structure, ignore generated outputs)
 reports/*
 !reports/.gitkeep
 !reports/figures/
-!reports/figures/**
-reports/figures/.gitkeep
+!reports/figures/.gitkeep
+!reports/baselines/
+!reports/baselines/.gitkeep
+
+# Explicitly ignore all other files in reports subfolders
+reports/figures/*
+!reports/figures/.gitkeep
+reports/baselines/*
+!reports/baselines/.gitkeep
 
 # Credentials / tokens
 .kaggle/                  # %HOMEPATH%\.kaggle on Windows (don’t commit kaggle.json)
