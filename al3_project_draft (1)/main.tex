@@ -1,0 +1,237 @@
+\documentclass[11pt]{article}
+
+% ACL / course template style
+\usepackage[]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+
+% Encoding and typography
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+
+% Figures, tables, URLs
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{url}
+
+\title{Group 28 Progress Report:\\Traffic Accident Severity Prediction}
+
+\author{
+  Christian Canlas, Aaryan Kandwal, Samir Matani \\
+  \texttt{\{canlasc,kandwala,matans1\}@mcmaster.ca}
+}
+
+\date{November 2025}
+
+\begin{document}
+\maketitle
+% \begin{abstract}
+% \end{abstract}
+
+\section{Introduction}
+
+This project aims to predict the severity of road accidents in the United States using historical accident data enriched with geospatial, temporal, and weather features. The goal is to classify each accident into one of four severity levels (1--4) representing increasing impact. Predicting severity can help emergency dispatchers allocate resources efficiently and assist transportation planners in identifying high-risk areas. The primary challenges include large-scale data processing, heavy class imbalance, and maintaining interpretability for public-safety applications.
+
+\section{Related Work}
+
+Prior research on traffic accident severity prediction has explored a range of classical, ensemble, and deep learning methods. \citet{feng2019accident} demonstrated that tree-based models such as Random Forests and Gradient Boosting outperform simple linear models in handling heterogeneous traffic data that include temporal and environmental attributes. Addressing the common issue of class imbalance, \citet{chawla2002smote} introduced the Synthetic Minority Over-Sampling Technique (SMOTE), which generates artificial examples for underrepresented classes; this method directly informs our plan to improve recall for severe accident categories. For robust and interpretable machine learning workflows, \citet{raschka2022mlpytorch} described practical strategies for preprocessing, feature encoding, and evaluation using \texttt{scikit-learn} pipelines---principles reflected in our current implementation. The U.S. Accidents dataset compiled by \citet{moosavi2023usaccidents} remains the most comprehensive open dataset of multi-year, geospatial accident records, serving as our primary data source. More recent work by \citet{zhao2020deeplearning} extended the field by integrating spatial and temporal dependencies through deep learning architectures (CNN--LSTM), highlighting the potential for future extensions of our project beyond traditional tabular models. Together, these studies outline the key directions for our approach: managing class imbalance, maintaining interpretability, and leveraging spatiotemporal features to improve prediction of accident severity.
+
+\section{Dataset}
+
+The dataset used is the U.S. Accidents (2016--2023) dataset compiled from the U.S. Department of Transportation and state APIs. A subset of approximately 100{,}000 rows was sampled for computational feasibility.
+
+\subsection{Class Distribution}
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lrr}
+\toprule
+Severity & Count & Percentage \\
+\midrule
+1 & 98     & 0.1\% \\
+2 & 55\,025 & 55.0\% \\
+3 & 44\,844 & 44.9\% \\
+4 & 33     & 0.03\% \\
+\bottomrule
+\end{tabular}
+\caption{Class distribution for the sampled subset of the U.S. Accidents dataset.}
+\label{tab:class-dist}
+\end{table}
+
+The dataset is heavily imbalanced, dominated by classes~2 and~3. This imbalance directly affects model recall for the rare severe accidents (class~4). Each record includes timestamps, coordinates, and environmental factors at the time of the crash.
+
+\subsection{Preprocessing}
+
+The pipeline (\texttt{configs/default.yaml}) automates:
+\begin{itemize}
+  \item Parsing raw CSVs from Kaggle into \texttt{data/raw/}.
+  \item Feature engineering: duration (\texttt{End\_Time--Start\_Time}), hour, day-of-week, and month.
+  \item Cyclical sine--cosine encodings for time variables.
+  \item One-hot encoding of categorical fields and preservation of sparse format (\texttt{.npz}).
+  \item Stratified 70/15/15 train--validation--test split.
+\end{itemize}
+EDA reports (\texttt{eda\_overview.json}, \texttt{class\_distribution.csv}) summarize missingness, numeric statistics, and class imbalance.
+
+\section{Features}
+
+Model inputs include both environmental and temporal descriptors:
+\begin{itemize}
+  \item \textbf{Numerical:} Distance(mi), Temperature(F), Visibility(mi), Wind\_Speed(mph), Precipitation(in), Duration(min).
+  \item \textbf{Categorical:} Weather\_Condition, Sunrise\_Sunset, Traffic\_Signal, Junction, Crossing.
+  \item \textbf{Derived Temporal:} Hour, Day of Week, Month (cyclically encoded).
+\end{itemize}
+All features are stored as sparse matrices in \texttt{data/processed/}. Scaling was disabled to reduce memory usage, and low-frequency categories were bucketed to maintain a compact one-hot representation.
+
+\section{Implementation}
+
+The data preprocessing pipeline is implemented in \texttt{src/traffic\_severity/preprocess.py} and configured through a typed \texttt{PreprocessConfig}. Raw CSV files are ingested, optionally subsampled for feasibility, and exploratory data reports (row and column counts, missingness, and class distribution) are generated in the \texttt{reports\_dir}. Rows with missing target labels are dropped. Columns with more than 60\% missing values, identifier fields, and manually excluded columns are removed to reduce noise and memory usage.
+
+Temporal variables are standardized before modeling. From the original start and end timestamps, a \texttt{duration\_min} feature is derived as the time difference in minutes. For the start time, we extract the hour of day, day of week, and month, encoding each cyclically with sine--cosine pairs to capture periodicity. The raw datetime columns are then removed so that only engineered temporal features remain. After feature engineering, the dataset is split into features ($X$) and labels ($y$), and columns are divided into numeric and categorical subsets.
+
+Feature preprocessing uses a \texttt{ColumnTransformer} containing two pipelines. Numeric columns are imputed with the median and optionally scaled using \texttt{StandardScaler} (disabled in current runs to preserve sparsity). Categorical columns are imputed with the most frequent value and one-hot encoded via \texttt{OneHotEncoder(handle\_unknown="ignore")}, with an optional minimum-frequency threshold for rare categories. The fitted transformer is serialized using \texttt{joblib}, and the transformed matrices are stored as compressed sparse arrays (\texttt{.npz}) for the train, validation, and test splits, together with JSON metadata describing feature names and shapes.
+
+Dataset partitioning follows a two-stage, stratified split defined in \texttt{split\_data}. First, 15\% of the data is held out as a test set using \texttt{train\_test\_split} with \texttt{stratify=y} and \texttt{random\_state=42}. From the remaining 85\%, an additional split ensures that 15\% of the original dataset serves as validation data, leaving 70\% for training. Stratification is applied in both stages to preserve the original class distribution across all sets. This 70/15/15 train/validation/test split is used consistently for every baseline.
+
+On top of the preprocessed sparse design matrix, several baseline classifiers are trained through the project’s \texttt{make baselines} target: a majority-class Dummy classifier, two logistic-regression variants (\texttt{liblinear} and \texttt{saga} solvers), a linear SVM, and a Random Forest. All models use \texttt{class\_weight="balanced"} to offset severe class imbalance. Logistic regression minimizes the regularized log-loss, the linear SVM minimizes a hinge loss, and the Random Forest aggregates decision trees trained on bootstrap samples and split by Gini impurity. These baselines provide a spectrum of linear and non-linear learners with varying computational cost and interpretability.
+
+\section{Results and Evaluation}
+
+\subsection{Evaluation Protocol}
+
+All models share a consistent evaluation framework. The preprocessing pipeline generates a stratified 70/15/15 train/validation/test split using a fixed random seed (\texttt{random\_state=42}) to preserve class proportions. Models are trained on the training subset and evaluated on the validation split. Overall accuracy and macro-averaged F1 are reported, complemented by per-class F1 scores and normalized confusion matrices that highlight imbalance effects. The held-out test set remains unused for final reporting. Future iterations will replace this single split with stratified $k$-fold cross-validation for more robust estimates.
+
+\subsection{Dummy Classifier}
+
+The majority-class Dummy classifier predicts all records as severity~2, providing a baseline lower bound. As shown in Figure~\ref{fig:cm-dummy}, every true class is misclassified into class~2, resulting in apparent accuracy of 0.55 due solely to class imbalance and macro-F1~=~0.177. This confirms that any model exceeding these values provides meaningful learning.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cm_majority.png}
+\caption{Normalized confusion matrix for Dummy (majority-class) baseline.}
+\label{fig:cm-dummy}
+\end{figure}
+
+\subsection{Logistic Regression (liblinear)}
+
+The \texttt{liblinear} logistic regression performs well on the dominant classes~2 and~3, achieving 0.89 and 0.93 recall respectively (Figure~\ref{fig:cm-liblinear}). However, it fails to detect the minority classes~1 and~4. The confusion matrix reveals that severe accidents (class~4) are consistently predicted as class~3. Accuracy reaches~0.905 with macro-F1~=~0.454.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cm_logreg_liblinear.png}
+\caption{Normalized confusion matrix for Logistic Regression (\texttt{liblinear}) baseline.}
+\label{fig:cm-liblinear}
+\end{figure}
+
+\subsection{Logistic Regression (saga)}
+
+The \texttt{saga} solver, intended for high-dimensional sparse data, diverged under extreme imbalance (Figure~\ref{fig:cm-saga}). Predictions are highly dispersed across classes, showing degraded performance even for the majority classes. Accuracy dropped to~0.432 with macro-F1~=~0.265, confirming solver instability with the sparse feature matrix.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cm_logreg_saga.png}
+\caption{Normalized confusion matrix for Logistic Regression (\texttt{saga}) baseline.}
+\label{fig:cm-saga}
+\end{figure}
+
+\subsection{Linear SVM}
+
+The linear SVM achieved balanced accuracy across classes~2 and~3 (0.90 and~0.93 recall) and slightly better handling of class~1 relative to logistic regression (Figure~\ref{fig:cm-svm}). Minority classes~1 and~4 remain underrepresented, though the SVM’s margin-based loss helped maintain generalization with less overfitting. Accuracy was~0.914 and macro-F1~=~0.458.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cm_linearsvc.png}
+\caption{Normalized confusion matrix for Linear SVM baseline.}
+\label{fig:cm-svm}
+\end{figure}
+
+\subsection{Random Forest}
+
+The Random Forest achieved the best overall trade-off between precision and recall. Figure~\ref{fig:cm-rf} shows strong recognition of classes~2 and~3 (0.92 and~0.93 recall) while modestly improving class~4 detection (0.20 predicted as~2, 0.80 as~3). Although still failing to correctly isolate severe accidents, the ensemble approach captured nonlinear patterns missed by linear models. Validation accuracy reached~0.926 and macro-F1~=~0.463.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{cm_rf.png}
+\caption{Normalized confusion matrix for Random Forest baseline.}
+\label{fig:cm-rf}
+\end{figure}
+
+\subsection{Model Comparison}
+
+\begin{table}[t]
+\centering
+\caption{Validation performance comparison across baseline models.}
+\label{tab:baseline-results}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Model} & \textbf{Accuracy} & \textbf{Macro F1} \\
+\midrule
+Random Forest & 0.926 & 0.463 \\
+Linear SVM & 0.914 & 0.458 \\
+LogReg (liblinear) & 0.905 & 0.454 \\
+LogReg (saga) & 0.432 & 0.265 \\
+Majority (Dummy) & 0.550 & 0.177 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+While all models performed similarly on the dominant classes, the Random Forest achieved the best macro-F1 and overall accuracy. Linear SVM achieved comparable balance with lower computational cost, suggesting it as a strong baseline for future re-weighting and resampling experiments. The poor results of the \texttt{saga} solver highlight the sensitivity of certain optimizers to sparse high-dimensional inputs.
+
+Overall, these results confirm that while classical linear models can fit the dominant classes, ensemble methods yield higher macro-F1 and better stability under imbalance. Upcoming iterations will integrate SMOTE resampling and gradient-boosting ensembles to further improve minority-class recall.
+
+\section{Feedback and Plans}
+
+TA feedback highlighted two directions:
+\begin{itemize}
+  \item Implement resampling or reweighting strategies (e.g., SMOTE, cost-sensitive loss) to improve minority-class recall.
+  \item Extend evaluation to cross-validation rather than a single stratified split.
+\end{itemize}
+
+For the final report, we plan to:
+\begin{enumerate}
+  \item Train advanced ensemble models (XGBoost, LightGBM) and compare to current baselines.
+  \item Investigate grouping classes into binary outcomes (minor vs.\ severe) to stabilize learning.
+  \item Integrate SHAP explainability plots to visualize dominant features affecting severity.
+  \item Optimize pipeline efficiency for full-scale dataset execution beyond 100k samples.
+\end{enumerate}
+
+\section*{Team Contributions}
+
+\textbf{Christian Canlas:} Repository setup, Kaggle data integration, preprocessing scripts.\\
+\textbf{Aaryan Kandwal:} Baseline model implementation, evaluation metrics, progress-report drafting.\\
+\textbf{Samir Matani:} EDA visualization, result interpretation, and document formatting.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem[Feng et~al.(2019)]{feng2019accident}
+Y.~Feng, Q.~Li, Z.~Zhang, and Y.~Wang.
+\newblock A machine learning approach to predict traffic accident severity.
+\newblock In \emph{Proceedings of the IEEE International Conference on Data Mining (ICDM)}, 2019.
+
+\bibitem[Chawla et~al.(2002)]{chawla2002smote}
+N.~V. Chawla, K.~W. Bowyer, L.~O. Hall, and W.~P. Kegelmeyer.
+\newblock {SMOTE}: Synthetic minority over-sampling technique.
+\newblock \emph{Journal of Artificial Intelligence Research}, 16:321--357, 2002.
+
+\bibitem[Raschka et~al.(2022)]{raschka2022mlpytorch}
+S.~Raschka, Y.~Liu, and V.~Mirjalili.
+\newblock \emph{Machine Learning with PyTorch and Scikit-Learn}.
+\newblock Packt Publishing, 2022.
+
+\bibitem[Moosavi(2023)]{moosavi2023usaccidents}
+S.~Moosavi.
+\newblock {U.S. Accidents (2016--2023)} [Dataset].
+\newblock Kaggle, 2023.
+\newblock \url{https://www.kaggle.com/sobhanmoosavi/us-accidents}.
+
+\bibitem[Zhao et~al.(2020)]{zhao2020deeplearning}
+X.~Zhao, S.~Chen, and Y.~Wang.
+\newblock A deep learning framework for traffic accident prediction based on spatiotemporal features.
+\newblock \emph{IEEE Access}, 8:143949--143957, 2020.
+\newblock \url{https://doi.org/10.1109/ACCESS.2020.3014262}.
+
+\end{thebibliography}
+
+\end{document}
