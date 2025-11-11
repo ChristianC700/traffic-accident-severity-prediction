@@ -1,0 +1,248 @@
+\documentclass[11pt]{article}
+
+% ACL / course template style
+\usepackage[]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+
+% Encoding and typography
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+
+% Figures, tables, URLs
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{float}
+
+
+
+\title{Group 28 Progress Report:\\Traffic Accident Severity Prediction}
+
+\author{
+  Christian Canlas, Aaryan Kandwal, Samir Matani \\
+  \texttt{\{canlasc,kandwala,matans1\}@mcmaster.ca}
+}
+
+\date{November 2025}
+
+\begin{document}
+\maketitle
+% \begin{abstract}
+% \end{abstract}
+
+\section{Introduction}
+
+
+Road traffic accidents are a leading cause of morbidity, mortality, and economic loss in the United States. The severity of each incident directly affects emergency response, congestion, and long-term public safety planning. Accurately estimating accident severity at or near the time of occurrence can help dispatchers prioritize resources, guide dynamic routing, and inform infrastructure investments in high-risk regions.
+
+This project frames accident severity prediction as a four-class classification task, with labels from 1 (minimal impact) to 4 (severe impact with long delays). Using a large-scale dataset of historical U.S. accidents containing geospatial, temporal, and weather features, we aim to build scalable, interpretable models that address class imbalance and help stakeholders understand the drivers of severe outcomes.
+
+\section{Related Work}
+
+Research on traffic accident severity prediction has progressed from traditional statistical modeling to machine learning and deep learning methods. Early studies examined the trade-off between predictive performance and causal interpretability in highway safety data \citep{mannering2020bigdata}. More recent work highlights the effectiveness of data-driven approaches: \citet{feng2019accident} found that tree-based ensemble models such as Random Forests and Gradient Boosting outperform linear classifiers for heterogeneous traffic, weather, and temporal features. To mitigate class imbalance, \citet{chawla2002smote} introduced the Synthetic Minority Over-Sampling Technique (SMOTE), now a standard for improving recall of rare severe-accident cases.
+
+Deep learning frameworks further capture spatial and temporal dependencies in roadway data. \citet{zhao2020deeplearning} proposed a spatiotemporal neural network combining convolutional and recurrent layers, achieving higher accuracy in multi-class severity prediction. Extending this, \citet{shangguan2025vae} developed a hybrid model integrating Variational Autoencoders with Graph Convolutional Networks to enhance performance on imbalanced datasets. Meanwhile, \citet{pei2025interpretable} emphasized interpretability in safety-critical systems through explainable machine learning. The U.S. Accidents dataset (2016–2023) \citep{moosavi2023usaccidents} offers a comprehensive open resource for geospatial and environmental traffic data, serving as a strong foundation for modern modeling approaches.
+
+
+\section{Dataset}
+
+This project uses the U.S. Accidents (2016--2023) dataset \citep{moosavi2023usaccidents}, a large-scale open dataset compiled from sources such as the U.S. Department of Transportation, traffic cameras, and state APIs. It contains over seven million accident records across the United States with detailed geospatial, temporal, environmental, and road-context information.
+
+For this progress report, we analyze a subset of 100{,}000 rows sampled from the raw CSV (\texttt{sample\_n\_rows: 100000}) to maintain computational feasibility while preserving diversity in location, weather, and time. The target variable \texttt{Severity} has four levels (1--4), where higher values correspond to more serious impacts and longer delays. The subset is highly imbalanced: severity~2 and~3 dominate (55{,}025 and 44{,}844 examples), while severity~1 and~4 are rare (98 and 33 examples). This motivates later use of imbalance-aware methods.
+
+Each record includes numeric, categorical, and temporal fields describing accident conditions, such as \texttt{Distance(mi)}, \texttt{Start\_Lat}, \texttt{Start\_Lng}, \texttt{Weather\_Condition}, temperature, visibility, precipitation, and contextual indicators like \texttt{Sunrise\_Sunset}, \texttt{Traffic\_Signal}, \texttt{Junction}, and \texttt{Crossing}. The preprocessing configuration focuses on this subset of features to provide a compact yet informative representation of environmental and infrastructural factors influencing severity.
+
+\subsection{Preprocessing Overview}
+
+The raw CSV is read, and exploratory data analysis artifacts are generated, including dataset statistics, missingness rates, and class counts. Rows with missing severity labels are dropped. \texttt{Start\_Time} and \texttt{End\_Time} are parsed to derive accident duration (minutes). Temporal features---hour, weekday, and month---are encoded cyclically using sine and cosine. Columns with excessive missingness and identifiers such as \texttt{ID} are removed. The remaining numeric and categorical features form the input for later modeling stages.
+
+\subsection{Class Distribution}
+
+\begin{table}[H]
+\centering
+\caption{Class distribution for the sampled subset of the U.S. Accidents dataset.}
+\label{tab:class-dist}
+\begin{tabular}{lrr}
+\toprule
+Severity & Count & Percentage \\
+\midrule
+1 & 98     & 0.1\% \\
+2 & 55\,025 & 55.0\% \\
+3 & 44\,844 & 44.9\% \\
+4 & 33     & 0.03\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The dataset is heavily imbalanced, dominated by classes~2 and~3, which affects model recall for the rare severe cases (class~4). Each record includes timestamps, coordinates, and environmental factors at the time of the crash.
+
+\subsection{Preprocessing}
+
+The pipeline (\texttt{configs/default.yaml}) automates:
+\begin{itemize}
+  \item Parsing raw CSVs from Kaggle into \texttt{data/raw/}.
+  \item Feature engineering: duration, hour, day-of-week, and month.
+  \item Cyclical sine--cosine encodings for time variables.
+  \item One-hot encoding of categorical fields and preservation of sparse format (\texttt{.npz}).
+  \item Stratified 70/15/15 train--validation--test split.
+\end{itemize}
+EDA reports (\texttt{eda\_overview.json}, \texttt{class\_distribution.csv}) summarize missingness, numeric statistics, and class imbalance.
+
+
+\section{Features}
+
+The model inputs consist of engineered numeric, categorical, and temporal features describing the environmental and spatial context of each accident. Selected features balance predictive power with interpretability and align with the preprocessing configuration:
+
+\begin{itemize}
+  \item \textbf{Numerical:} Distance(mi), Temperature(F), Visibility(mi), Wind\_Speed(mph), Precipitation(in), and Duration(min), where Duration is the time difference between \texttt{Start\_Time} and \texttt{End\_Time}.
+  \item \textbf{Categorical:} Weather\_Condition, Sunrise\_Sunset, Traffic\_Signal, Junction, and Crossing, one-hot encoded with rare categories grouped into an “other” bucket to reduce sparsity.
+  \item \textbf{Derived Temporal:} Hour, Day of Week, and Month extracted from \texttt{Start\_Time} and represented via sine and cosine transformations to preserve periodicity.
+\end{itemize}
+
+Feature preprocessing is automated through a \texttt{ColumnTransformer} pipeline. Numeric columns are imputed with median values, and categorical fields with their most frequent value before encoding. Scaling of numeric features was disabled (\texttt{scale\_numeric: false}) to preserve sparse matrices and reduce memory usage during training.
+
+The resulting feature matrix is saved in compressed sparse format under \texttt{data/processed/}, enabling efficient processing for both linear and neural models. Logistic Regression and Linear SVM operate directly on one-hot features, while neural models (MLP and Feed-Forward Network) convert sparse matrices to dense tensors for training. The engineered temporal and environmental features together allow models to capture seasonal, spatial, and weather-related patterns influencing accident severity.
+
+
+
+\section{Implementation}
+
+The implementation consists of two main components: a preprocessing pipeline and a model training script. The preprocessing stage, implemented in \texttt{src/traffic\_severity/preprocess.py} and configured via a typed \texttt{PreprocessConfig}, ingests raw CSVs from the U.S. Accidents dataset and loads a 100{,}000-row subset for computational feasibility. During preprocessing, automated reports summarize dataset size, missing values, and class distribution. Rows with missing targets are dropped, and columns with over 60\% missingness or identifier roles are removed to reduce noise and redundancy.
+
+Temporal feature engineering is central to this stage. A \texttt{duration\_min} variable is computed as the time difference between \texttt{Start\_Time} and \texttt{End\_Time}. From \texttt{Start\_Time}, the hour, weekday, and month are extracted and encoded with sine--cosine pairs to capture periodicity, replacing raw datetime columns to prevent leakage. The data is then divided into numeric and categorical features, with \texttt{Severity} isolated as the target.
+
+Feature transformation uses a \texttt{ColumnTransformer} with two sub-pipelines: numeric columns are median-imputed, and categorical columns are imputed with the most frequent value and one-hot encoded via \texttt{OneHotEncoder(handle\_unknown="ignore")}. Categories with fewer than 20 occurrences are grouped to prevent extreme sparsity. Numeric scaling is disabled for sparse compatibility and memory efficiency. The fitted transformer is serialized with \texttt{joblib}, and transformed train, validation, and test matrices are stored as compressed sparse arrays with accompanying JSON metadata.
+
+Dataset partitioning follows a stratified 70/15/15 split to preserve class balance across subsets. The pipeline outputs ready-to-use artifacts under \texttt{data/processed/} for direct input into \texttt{baselines.py}.
+
+Model training and evaluation occur in \texttt{baselines.py}, which fits four models: Logistic Regression, Linear SVM, a one-layer Multi-Layer Perceptron (MLP), and a two-layer Feed-Forward Neural Network (FFNN). Logistic Regression uses the SAGA solver with $L_2$ regularization and class weighting; the Linear SVM employs a hinge-loss objective with class balancing. Both, implemented in \texttt{scikit-learn}, operate on sparse matrices.
+
+The MLP and FFNN are implemented in PyTorch to capture non-linear relationships. The MLP has one hidden layer of 128 ReLU neurons with dropout; the FFNN extends this to two hidden layers (256 and 128 units) with dropout 0.3. Both use cross-entropy loss, Adam-based optimizers (Adam for MLP, AdamW for FFNN), a learning rate of $10^{-3}$, and weight decay of $10^{-4}$ for 15 epochs. Sparse inputs are converted to dense tensors, and Apple Metal (MPS) is used when available for acceleration.
+
+Each model produces validation predictions with accuracy, macro F1, and per-class precision/recall. Normalized confusion matrices are saved under \texttt{reports/figures/}, and JSON summaries under \texttt{reports/baselines/}. This workflow ensures consistent, reproducible evaluation across traditional and neural models.
+
+
+
+\section{Results and Evaluation}
+
+Model performance is evaluated on the held-out validation split, which contains 15{,}001 examples drawn using a stratified 70/15/15 train/validation/test split. All hyperparameters are fixed across runs, and only the model architecture is varied. We report overall accuracy and macro F1-score, and we examine per-class performance through normalized confusion matrices produced by \texttt{baselines.py}. Macro F1 is particularly important in this setting because it weights each class equally and therefore penalizes models that perform poorly on the rare severity levels 1 and 4.
+
+Table~\ref{tab:val-results} summarizes the validation performance for all four models. The two-layer Feed-Forward Neural Network (FFNN) achieves the highest accuracy (0.922) and macro F1-score (0.461), followed closely by the Linear SVM (accuracy 0.915, macro F1 0.458) and the one-hidden-layer MLP (accuracy 0.908, macro F1 0.454). Logistic Regression performs substantially worse, with an accuracy of 0.664 and a macro F1-score of 0.369, despite using class weighting to compensate for imbalance.
+
+\begin{table}[h]
+\centering
+\caption{Validation performance of baseline models on the four-class severity prediction task.}
+\begin{tabular}{lcc}
+\hline
+Model & Accuracy & Macro F1 \\
+\hline
+Logistic Regression & 0.664 & 0.369 \\
+Linear SVM & 0.915 & 0.458 \\
+MLP (1-layer, PyTorch) & 0.908 & 0.454 \\
+FFNN (2-layer, PyTorch) & 0.922 & 0.461 \\
+\hline
+\end{tabular}
+\label{tab:val-results}
+\end{table}
+
+The confusion matrices in Figures~\ref{fig:cm-logreg}--\ref{fig:cm-ffnn} provide additional insight into the class-wise behavior of each model. For all models, the vast majority of validation examples belong to severity 2 and 3 (8{,}254 and 6{,}727 instances respectively), and these classes are predicted with relatively high precision and recall. For example, the FFNN attains F1-scores of approximately 0.93 for both severity 2 and 3, and the Linear SVM and MLP obtain similar values. The normalized confusion matrices show that most errors arise from confusion between these two adjacent classes, rather than from predictions of the extreme classes.
+
+In contrast, none of the models currently handle the rare severity levels 1 and 4 well. On the validation set there are only 15 instances of class 1 and 5 instances of class 4. The Linear SVM, MLP, and FFNN all assign zero correct predictions to these classes, leading to precision, recall, and F1-scores of 0.0 for both levels. Logistic Regression achieves a non-zero F1-score for class 1 by predicting a small number of examples as severity 1, but this comes at the cost of additional false positives and does not improve the overall macro F1-score. In all confusion matrices, rows corresponding to classes 1 and 4 are dominated by predictions of severity 2 or 3.
+
+These results suggest that the current feature set and training strategy are sufficient to distinguish between medium and serious accidents (classes 2 and 3) but are not yet adequate for the very rare minimal and severe cases (classes 1 and 4). Future work will focus on techniques such as targeted resampling, class-specific loss weighting, or hierarchical modeling of severity levels to improve performance on the minority classes while preserving the strong performance on the majority classes.
+
+% Example figure inclusions (filenames may be adjusted as needed)
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.45\textwidth]{cm_logreg.png}
+    \caption{Normalized confusion matrix for Logistic Regression on the validation set.}
+    \label{fig:cm-logreg}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.45\textwidth]{cm_linearsvc.png}
+    \caption{Normalized confusion matrix for the Linear SVM on the validation set.}
+    \label{fig:cm-linearsvc}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.45\textwidth]{cm_mlp.png}
+    \caption{Normalized confusion matrix for the one-hidden-layer MLP on the validation set.}
+    \label{fig:cm-mlp}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.45\textwidth]{cm_ffnn.png}
+    \caption{Normalized confusion matrix for the two-layer Feed-Forward Neural Network on the validation set.}
+    \label{fig:cm-ffnn}
+\end{figure}
+
+\section{Feedback and Plans}
+During our progress meeting, our TA provided feedback primarily focused on two aspects of the project: the heavy class imbalance in the dataset and the limited complexity of some of our baseline models. The class distribution in the sampled subset is highly skewed, with severity levels 2 and 3 representing over 99\% of the data, while levels 1 and 4 are nearly absent. This imbalance was reflected in the evaluation results, where all models achieved high precision and recall for the dominant classes but failed to correctly identify any examples from the minority classes. The TA emphasized that addressing this imbalance should be the top priority before introducing additional model complexity or tuning.
+
+In response, our next steps will involve implementing data-level and algorithmic strategies to mitigate class imbalance. At the preprocessing level, we plan to experiment with resampling techniques such as SMOTE and class-specific oversampling to synthetically generate examples of the rare severity categories. We will also test downsampling of the majority classes to assess whether a more balanced training distribution improves macro-level performance. On the modeling side, we will incorporate class-weighted loss functions in our neural networks, similar to the approach used in the logistic regression and SVM baselines, to explicitly penalize misclassification of the minority classes.
+
+Another point of feedback was the reliance on a single 70/15/15 stratified split for evaluation. Although this setup ensures class proportions are preserved, it may not fully capture the variance in model performance across different folds. To obtain more reliable metrics, we plan to implement $k$-fold cross-validation (likely $k=5$) in the next phase, which will average results over multiple splits and provide a more stable estimate of generalization performance.
+
+Beyond these adjustments, we aim to experiment with moderately deeper neural architectures and regularization strategies such as early stopping and learning-rate scheduling to improve convergence. These planned refinements will directly address the weaknesses identified in our current results and help establish a stronger foundation for final model evaluation.
+
+
+\section*{Team Contributions}
+
+\textbf{Christian Canlas:} Repository setup, Kaggle data integration, preprocessing scripts.\\
+\textbf{Aaryan Kandwal:} Baseline model implementation, evaluation metrics, progress-report drafting.\\
+\textbf{Samir Matani:} EDA visualization, result interpretation, and document formatting.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem[Feng et~al.(2019)]{feng2019accident}
+Y.~Feng, Q.~Li, Z.~Zhang, and Y.~Wang.
+\newblock A machine learning approach to predict traffic accident severity.
+\newblock In \emph{Proceedings of the IEEE International Conference on Data Mining (ICDM)}, 2019.
+
+\bibitem[Chawla et~al.(2002)]{chawla2002smote}
+N.~V. Chawla, K.~W. Bowyer, L.~O. Hall, and W.~P. Kegelmeyer.
+\newblock SMOTE: Synthetic minority over-sampling technique.
+\newblock \emph{Journal of Artificial Intelligence Research}, 16:321--357, 2002.
+
+\bibitem[Moosavi(2023)]{moosavi2023usaccidents}
+S.~Moosavi.
+\newblock U.S. Accidents (2016--2023) [Dataset].
+\newblock Kaggle, 2023.
+\newblock \url{https://www.kaggle.com/datasets/sobhanmoosavi/us-accidents}.
+
+\bibitem[Zhao et~al.(2020)]{zhao2020deeplearning}
+X.~Zhao, S.~Chen, and Y.~Wang.
+\newblock A deep learning framework for traffic accident prediction based on spatiotemporal features.
+\newblock \emph{IEEE Access}, 8:143949--143957, 2020.
+\newblock \url{https://doi.org/10.1109/ACCESS.2020.3014262}.
+
+\bibitem[Pei et~al.(2025)]{pei2025interpretable}
+Y.~Pei, J.~Liu, and H.~Zhang.
+\newblock Traffic accident severity prediction based on interpretable machine learning.
+\newblock \emph{Journal of Intelligent Transportation Systems}, 2025.
+\newblock \url{https://doi.org/10.1080/19427867.2024.2398336}.
+
+\bibitem[Shangguan et~al.(2025)]{shangguan2025vae}
+W.~Shangguan, J.~Wu, and T.~Zhao.
+\newblock Predicting road traffic accident severity from imbalanced data using VAE–Attention and Graph Convolutional Networks.
+\newblock \emph{Scientific Reports}, 15(1):674, 2025.
+\newblock \url{https://doi.org/10.1038/s41598-025-17064-4}.
+
+\bibitem[Mannering et~al.(2020)]{mannering2020bigdata}
+F.~L. Mannering, V.~Shankar, and C.~Bhat.
+\newblock Big data, traditional data and the trade-offs between prediction and causality in highway-safety analysis.
+\newblock \emph{Analytic Methods in Accident Research}, 25:100113, 2020.
+\newblock \url{https://doi.org/10.1016/j.amar.2020.100113}.
+
+\end{thebibliography}
+
+
+\end{document}

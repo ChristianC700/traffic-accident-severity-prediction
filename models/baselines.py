@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Train quick baselines on preprocessed artifacts and evaluate on VAL (hold out TEST).
+Train classification models on preprocessed artifacts and evaluate on VAL (hold-out TEST).
 Saves:
   - reports/figures/cm_<model>.png   (normalized confusion matrix)
   - reports/baselines/<model>.json
@@ -15,16 +15,12 @@ import time
 from pathlib import Path
 from typing import Dict, Tuple
 
-import joblib
 import numpy as np
 import pandas as pd
 from scipy.sparse import load_npz, issparse
 
-from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import LinearSVC
-from sklearn.ensemble import RandomForestClassifier
-
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -36,6 +32,9 @@ from sklearn.metrics import (
 
 import matplotlib.pyplot as plt
 import yaml
+import torch
+from torch import nn
+from torch.utils.data import TensorDataset, DataLoader
 
 
 # ---------- IO helpers ----------
@@ -59,12 +58,22 @@ def _ensure_dir(p: Path) -> Path:
     return p
 
 
-def _maybe_dense_for_rf(X):
-    """RandomForest works best with dense arrays. Convert if sparse."""
+def _maybe_dense(X, tag: str = "[model]"):
+    """Convert sparse to dense for models that require/benefit from dense arrays."""
     if issparse(X):
-        print("[rf] Converting sparse CSR to dense for RandomForest (may use more RAM)…")
+        print(f"{tag} Converting sparse CSR to dense (may use more RAM)…")
         return X.toarray()
     return X
+
+
+def _get_torch_device():
+    """Pick MPS on Apple Silicon if available, else CPU."""
+    if torch.backends.mps.is_available():
+        print("[torch] Using MPS (Apple GPU) backend.")
+        return torch.device("mps")
+    else:
+        print("[torch] MPS not available; using CPU.")
+        return torch.device("cpu")
 
 
 # ---------- Visualization ----------
@@ -72,11 +81,10 @@ def _maybe_dense_for_rf(X):
 def pretty_model_name(key: str) -> str:
     """Map internal model keys to human-readable titles."""
     return {
-        "majority": "Dummy (Majority Class)",
-        "logreg_liblinear": "Logistic Regression (liblinear)",
-        "logreg_saga": "Logistic Regression (saga)",
+        "logreg": "Logistic Regression",
         "linearsvc": "Linear SVM",
-        "rf": "Random Forest",
+        "mlp": "Multi-layer Perceptron (PyTorch)",
+        "ffnn": "Feed-Forward Neural Network (2-Layer, PyTorch)",
     }.get(key, key)
 
 
@@ -110,59 +118,231 @@ def train_and_eval(
     class_weight: str | None,
 ) -> Tuple[Dict, np.ndarray]:
     """Train model and return metrics + confusion matrix."""
-    if model_name == "majority":
-        clf = DummyClassifier(strategy="most_frequent", random_state=random_state)
-        params = {"strategy": "most_frequent", "random_state": random_state}
 
-    elif model_name == "logreg_liblinear":
-        clf = LogisticRegression(
-            solver="liblinear",
-            max_iter=200,
-            random_state=random_state,
-            class_weight=class_weight,
-        )
-        params = {"solver": "liblinear", "max_iter": 200, "class_weight": class_weight, "random_state": random_state}
-
-    elif model_name == "logreg_saga":
+    # ---- Logistic Regression ----
+    if model_name == "logreg":
         clf = LogisticRegression(
             solver="saga",
-            max_iter=300,
             penalty="l2",
+            C=0.1,                # stronger regularization, may help convergence
+            max_iter=5000,        # more iterations than before
+            tol=1e-3,             # slightly looser stopping criterion
             random_state=random_state,
             class_weight=class_weight,
+            n_jobs=-1,
         )
-        params = {"solver": "saga", "penalty": "l2", "max_iter": 300, "class_weight": class_weight, "random_state": random_state}
+        params = {
+            "solver": "saga",
+            "penalty": "l2",
+            "max_iter": 2000,
+            "class_weight": class_weight,
+            "random_state": random_state,
+            "n_jobs": -1,
+        }
 
+        t0 = time.time()
+        clf.fit(X_train, y_train)
+        train_time = time.time() - t0
+
+        y_pred = clf.predict(X_val)
+
+    # ---- Linear SVM ----
     elif model_name == "linearsvc":
         clf = LinearSVC(
             random_state=random_state,
             class_weight=class_weight,
         )
-        params = {"class_weight": class_weight, "random_state": random_state}
+        params = {
+            "class_weight": class_weight,
+            "random_state": random_state,
+        }
 
-    elif model_name == "rf":
-        X_train = _maybe_dense_for_rf(X_train)
-        X_val = _maybe_dense_for_rf(X_val)
-        clf = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=None,
-            n_jobs=-1,
-            random_state=random_state,
-        )
-        params = {"n_estimators": 200, "max_depth": None, "n_jobs": -1, "random_state": random_state}
+        t0 = time.time()
+        clf.fit(X_train, y_train)
+        train_time = time.time() - t0
+
+        y_pred = clf.predict(X_val)
+
+    # ---- Neural Network (single-hidden-layer MLP, PyTorch) ----
+    elif model_name == "mlp":
+        X_train = _maybe_dense(X_train, tag="[mlp]")
+        X_val = _maybe_dense(X_val, tag="[mlp]")
+
+        device = _get_torch_device()
+
+        # Convert to torch tensors
+        X_train_t = torch.from_numpy(X_train.astype(np.float32))
+        y_train_t = torch.from_numpy(y_train.astype(np.int64))
+        X_val_t = torch.from_numpy(X_val.astype(np.float32))
+        y_val_t = torch.from_numpy(y_val.astype(np.int64))
+
+        num_features = X_train_t.shape[1]
+        num_classes = int(np.unique(y_train).shape[0])
+
+        class MLP(nn.Module):
+            def __init__(self, in_dim, hidden_dim, out_dim):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(in_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.2),
+                    nn.Linear(hidden_dim, out_dim),
+                )
+
+            def forward(self, x):
+                return self.net(x)
+
+        model = MLP(num_features, hidden_dim=128, out_dim=num_classes).to(device)
+
+        # Dataloaders
+        batch_size = 1024
+        train_ds = TensorDataset(X_train_t, y_train_t)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+        X_val_t = X_val_t.to(device)
+        y_val_t = y_val_t.to(device)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        epochs = 10
+
+        t0 = time.time()
+        model.train()
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                optimizer.zero_grad()
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * xb.size(0)
+
+            avg_loss = epoch_loss / len(train_ds)
+            print(f"[mlp] Epoch {epoch+1}/{epochs} - loss={avg_loss:.4f}")
+
+        train_time = time.time() - t0
+
+        # Evaluation
+        model.eval()
+        with torch.no_grad():
+            logits_val = model(X_val_t)
+            y_pred_t = torch.argmax(logits_val, dim=1)
+
+        y_pred = y_pred_t.cpu().numpy()
+
+        params = {
+            "type": "torch_mlp",
+            "hidden_dim": 128,
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "lr": 1e-3,
+            "device": str(device),
+        }
+
+    # ---- Two-Layer Feed-Forward Neural Network (PyTorch) ----
+    elif model_name == "ffnn":
+        X_train = _maybe_dense(X_train, tag="[ffnn]")
+        X_val = _maybe_dense(X_val, tag="[ffnn]")
+
+        device = _get_torch_device()
+
+        # Convert to torch tensors
+        X_train_t = torch.from_numpy(X_train.astype(np.float32))
+        y_train_t = torch.from_numpy(y_train.astype(np.int64))
+        X_val_t = torch.from_numpy(X_val.astype(np.float32))
+        y_val_t = torch.from_numpy(y_val.astype(np.int64))
+
+        num_features = X_train_t.shape[1]
+        num_classes = int(np.unique(y_train).shape[0])
+
+        class FeedForwardNN(nn.Module):
+            def __init__(self, in_dim, hidden1, hidden2, out_dim):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(in_dim, hidden1),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(hidden1, hidden2),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(hidden2, out_dim),
+                )
+
+            def forward(self, x):
+                return self.net(x)
+
+        model = FeedForwardNN(
+            in_dim=num_features,
+            hidden1=256,
+            hidden2=128,
+            out_dim=num_classes,
+        ).to(device)
+
+        # Dataloaders
+        batch_size = 1024
+        train_ds = TensorDataset(X_train_t, y_train_t)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+        X_val_t = X_val_t.to(device)
+        y_val_t = y_val_t.to(device)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+        epochs = 15
+
+        t0 = time.time()
+        model.train()
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                optimizer.zero_grad()
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item() * xb.size(0)
+
+            avg_loss = running_loss / len(train_ds)
+            print(f"[ffnn] Epoch {epoch+1}/{epochs} - loss={avg_loss:.4f}")
+
+        train_time = time.time() - t0
+
+        # Evaluation
+        model.eval()
+        with torch.no_grad():
+            logits_val = model(X_val_t)
+            y_pred_t = torch.argmax(logits_val, dim=1)
+
+        y_pred = y_pred_t.cpu().numpy()
+
+        params = {
+            "type": "torch_ffnn",
+            "hidden_layers": [256, 128],
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "lr": 1e-3,
+            "weight_decay": 1e-4,
+            "device": str(device),
+        }
 
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
 
-    t0 = time.time()
-    clf.fit(X_train, y_train)
-    train_time = time.time() - t0
-
-    y_pred = clf.predict(X_val)
-
+    # ---- Common metrics ----
     acc = float(accuracy_score(y_val, y_pred))
     macro_f1 = float(f1_score(y_val, y_pred, average="macro"))
-    p, r, f1s, support = precision_recall_fscore_support(y_val, y_pred, labels=np.unique(y_val), zero_division=0)
+    p, r, f1s, support = precision_recall_fscore_support(
+        y_val, y_pred, labels=np.unique(y_val), zero_division=0
+    )
 
     report = {
         "model": model_name,
@@ -172,10 +352,18 @@ def train_and_eval(
             "accuracy": acc,
             "macro_f1": macro_f1,
             "per_class": [
-                {"class": int(cls), "precision": float(pi), "recall": float(ri), "f1": float(fi), "support": int(si)}
+                {
+                    "class": int(cls),
+                    "precision": float(pi),
+                    "recall": float(ri),
+                    "f1": float(fi),
+                    "support": int(si),
+                }
                 for cls, pi, ri, fi, si in zip(np.unique(y_val), p, r, f1s, support)
             ],
-            "classification_report": classification_report(y_val, y_pred, digits=4),
+            "classification_report": classification_report(
+                y_val, y_pred, digits=4
+            ),
         },
     }
 
@@ -186,13 +374,39 @@ def train_and_eval(
 # ---------- CLI ----------
 
 def main():
-    parser = argparse.ArgumentParser(description="Run baseline classifiers on preprocessed artifacts (VAL evaluation).")
-    parser.add_argument("--meta", type=str, default="data/processed/meta.json", help="Path to meta.json written by preprocessing.")
-    parser.add_argument("--reports_dir", type=str, default="reports", help="Reports root directory.")
-    parser.add_argument("--config", type=str, default="configs/default.yaml", help="(Optional) config to log split strategy.")
-    parser.add_argument("--models", type=str, default="majority,logreg_liblinear,logreg_saga,linearsvc,rf",
-                        help="Comma-separated: majority,logreg_liblinear,logreg_saga,linearsvc,rf")
-    parser.add_argument("--class_weight", type=str, default="balanced", help="Class weight for LR/LinearSVC: None|balanced")
+    parser = argparse.ArgumentParser(
+        description="Run classifiers on preprocessed artifacts (VAL evaluation)."
+    )
+    parser.add_argument(
+        "--meta",
+        type=str,
+        default="data/processed/meta.json",
+        help="Path to meta.json written by preprocessing.",
+    )
+    parser.add_argument(
+        "--reports_dir",
+        type=str,
+        default="reports",
+        help="Reports root directory.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/default.yaml",
+        help="(Optional) config to log split strategy.",
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="logreg,linearsvc,mlp,ffnn",
+        help="Comma-separated: logreg,linearsvc,mlp,ffnn",
+    )
+    parser.add_argument(
+        "--class_weight",
+        type=str,
+        default="balanced",
+        help="Class weight for LR/SVMs: None|balanced",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -240,7 +454,7 @@ def main():
             X_val=X_val,
             y_val=y_val,
             random_state=args.seed,
-            class_weight=cw if m in {"logreg_liblinear", "logreg_saga", "linearsvc"} else None,
+            class_weight=cw if m in {"logreg", "linearsvc"} else None,
         )
         report["split"] = split_info
 
@@ -248,24 +462,28 @@ def main():
         out_json = json_dir / f"{m}.json"
         out_json.write_text(json.dumps(report, indent=2))
 
-        # Save a single normalized confusion matrix
+        # Save normalized confusion matrix
         pretty = pretty_model_name(m)
         out_png = figures_dir / f"cm_{m}.png"
-        save_confusion_png(cm, labels=labels, out_png=out_png, title=f"Confusion Matrix — {pretty}")
+        save_confusion_png(
+            cm, labels=labels, out_png=out_png, title=f"Confusion Matrix — {pretty}"
+        )
 
         # Add to summary
-        summary_rows.append({
-            "model": m,
-            "accuracy": report["metrics"]["accuracy"],
-            "macro_f1": report["metrics"]["macro_f1"],
-            "json": str(out_json),
-            "cm_png": str(out_png),
-        })
+        summary_rows.append(
+            {
+                "model": m,
+                "accuracy": report["metrics"]["accuracy"],
+                "macro_f1": report["metrics"]["macro_f1"],
+                "json": str(out_json),
+                "cm_png": str(out_png),
+            }
+        )
 
     # Write summary CSV
-    pd.DataFrame(summary_rows).sort_values("macro_f1", ascending=False).to_csv(
-        Path(args.reports_dir) / "baselines_summary.csv", index=False
-    )
+    pd.DataFrame(summary_rows).sort_values(
+        "macro_f1", ascending=False
+    ).to_csv(Path(args.reports_dir) / "baselines_summary.csv", index=False)
     print(f"[done] Wrote reports to: {args.reports_dir}")
 
 
