@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Train classification models on preprocessed artifacts and evaluate on VAL (hold-out TEST).
+Train classification models on preprocessed artifacts and evaluate on both VAL + TEST.
 Saves:
-  - reports/figures/cm_<model>.png   (normalized confusion matrix)
-  - reports/baselines/<model>.json
+  - reports/metrics/<model>_<split>.json
+  - reports/predictions/<model>_test_predictions.csv
+  - reports/figures/cm_<model>_<split>.png
   - reports/baselines_summary.csv
 """
 
@@ -19,8 +20,9 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import load_npz, issparse
 
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import LinearSVC
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -29,6 +31,7 @@ from sklearn.metrics import (
     confusion_matrix,
     ConfusionMatrixDisplay,
 )
+from sklearn.svm import LinearSVC
 
 import matplotlib.pyplot as plt
 import yaml
@@ -76,16 +79,58 @@ def _get_torch_device():
         return torch.device("cpu")
 
 
-# ---------- Visualization ----------
+# ---------- Class imbalance helpers ----------
+
+def compute_class_weights(y: np.ndarray) -> torch.Tensor:
+    """Compute inverse-frequency weights for CrossEntropyLoss."""
+    labels, counts = np.unique(y, return_counts=True)
+    counts = counts.astype(np.float32)
+    weights = counts.sum() / (len(labels) * counts)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+# ---------- Metrics / Visualization ----------
 
 def pretty_model_name(key: str) -> str:
     """Map internal model keys to human-readable titles."""
     return {
+        "dummy": "Dummy Classifier (Most Frequent)",
         "logreg": "Logistic Regression",
         "linearsvc": "Linear SVM",
         "mlp": "Multi-layer Perceptron (PyTorch)",
         "ffnn": "Feed-Forward Neural Network (2-Layer, PyTorch)",
+        "rf": "Random Forest",
     }.get(key, key)
+
+
+def build_metric_payload(y_true, y_pred, label_order: np.ndarray | None = None):
+    """Return metrics dict + confusion matrix for the provided split."""
+    if label_order is None:
+        label_order = np.unique(y_true)
+    acc = float(accuracy_score(y_true, y_pred))
+    macro_f1 = float(f1_score(y_true, y_pred, average="macro"))
+    precision, recall, f1s, support = precision_recall_fscore_support(
+        y_true, y_pred, labels=label_order, zero_division=0
+    )
+    metrics = {
+        "accuracy": acc,
+        "macro_f1": macro_f1,
+        "per_class": [
+            {
+                "class": int(cls),
+                "precision": float(pi),
+                "recall": float(ri),
+                "f1": float(fi),
+                "support": int(si),
+            }
+            for cls, pi, ri, fi, si in zip(label_order, precision, recall, f1s, support)
+        ],
+        "classification_report": classification_report(
+            y_true, y_pred, labels=label_order, digits=4
+        ),
+    }
+    cm = confusion_matrix(y_true, y_pred, labels=label_order)
+    return metrics, cm
 
 
 def save_confusion_png(cm: np.ndarray, labels: np.ndarray, out_png: Path, title: str):
@@ -114,28 +159,53 @@ def train_and_eval(
     y_train,
     X_val,
     y_val,
+    X_test,
+    y_test,
     random_state: int,
-    class_weight: str | None,
-) -> Tuple[Dict, np.ndarray]:
-    """Train model and return metrics + confusion matrix."""
+    linear_class_weight: str | None,
+    class_weight_tensor: torch.Tensor | None,
+    label_order: np.ndarray | None,
+) -> Tuple[Dict, np.ndarray, Dict, np.ndarray, Dict[str, np.ndarray]]:
+    """Train model and return metrics for validation + test splits."""
+
+    params: Dict = {}
+    y_pred_val: np.ndarray
+    y_pred_test: np.ndarray
+
+    # ---- Dummy baseline ----
+    if model_name == "dummy":
+        clf = DummyClassifier(strategy="most_frequent")
+        params = {"strategy": "most_frequent"}
+
+        dummy_train = np.zeros((len(y_train), 1))
+        dummy_val = np.zeros((len(y_val), 1))
+        dummy_test = np.zeros((len(y_test), 1))
+
+        t0 = time.time()
+        clf.fit(dummy_train, y_train)
+        train_time = time.time() - t0
+
+        y_pred_val = clf.predict(dummy_val)
+        y_pred_test = clf.predict(dummy_test)
 
     # ---- Logistic Regression ----
-    if model_name == "logreg":
+    elif model_name == "logreg":
         clf = LogisticRegression(
             solver="saga",
             penalty="l2",
-            C=0.1,                # stronger regularization, may help convergence
-            max_iter=5000,        # more iterations than before
-            tol=1e-3,             # slightly looser stopping criterion
+            C=0.1,
+            max_iter=5000,
+            tol=1e-3,
             random_state=random_state,
-            class_weight=class_weight,
+            class_weight=linear_class_weight,
             n_jobs=-1,
         )
         params = {
             "solver": "saga",
             "penalty": "l2",
-            "max_iter": 2000,
-            "class_weight": class_weight,
+            "max_iter": 5000,
+            "tol": 1e-3,
+            "class_weight": linear_class_weight,
             "random_state": random_state,
             "n_jobs": -1,
         }
@@ -144,16 +214,17 @@ def train_and_eval(
         clf.fit(X_train, y_train)
         train_time = time.time() - t0
 
-        y_pred = clf.predict(X_val)
+        y_pred_val = clf.predict(X_val)
+        y_pred_test = clf.predict(X_test)
 
     # ---- Linear SVM ----
     elif model_name == "linearsvc":
         clf = LinearSVC(
             random_state=random_state,
-            class_weight=class_weight,
+            class_weight=linear_class_weight,
         )
         params = {
-            "class_weight": class_weight,
+            "class_weight": linear_class_weight,
             "random_state": random_state,
         }
 
@@ -161,20 +232,50 @@ def train_and_eval(
         clf.fit(X_train, y_train)
         train_time = time.time() - t0
 
-        y_pred = clf.predict(X_val)
+        y_pred_val = clf.predict(X_val)
+        y_pred_test = clf.predict(X_test)
+
+    # ---- Random Forest ----
+    elif model_name == "rf":
+        clf = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=20,
+            min_samples_leaf=5,
+            class_weight="balanced",
+            n_jobs=-1,
+            random_state=random_state,
+        )
+        params = {
+            "n_estimators": 300,
+            "max_depth": 20,
+            "min_samples_leaf": 5,
+            "class_weight": "balanced",
+            "n_jobs": -1,
+            "random_state": random_state,
+        }
+
+        t0 = time.time()
+        clf.fit(X_train, y_train)
+        train_time = time.time() - t0
+
+        y_pred_val = clf.predict(X_val)
+        y_pred_test = clf.predict(X_test)
 
     # ---- Neural Network (single-hidden-layer MLP, PyTorch) ----
     elif model_name == "mlp":
-        X_train = _maybe_dense(X_train, tag="[mlp]")
-        X_val = _maybe_dense(X_val, tag="[mlp]")
+        X_train_dense = _maybe_dense(X_train, tag="[mlp]")
+        X_val_dense = _maybe_dense(X_val, tag="[mlp]")
+        X_test_dense = _maybe_dense(X_test, tag="[mlp]")
 
         device = _get_torch_device()
 
         # Convert to torch tensors
-        X_train_t = torch.from_numpy(X_train.astype(np.float32))
+        X_train_t = torch.from_numpy(X_train_dense.astype(np.float32))
         y_train_t = torch.from_numpy(y_train.astype(np.int64))
-        X_val_t = torch.from_numpy(X_val.astype(np.float32))
+        X_val_t = torch.from_numpy(X_val_dense.astype(np.float32))
         y_val_t = torch.from_numpy(y_val.astype(np.int64))
+        X_test_t = torch.from_numpy(X_test_dense.astype(np.float32))
+        y_test_t = torch.from_numpy(y_test.astype(np.int64))
 
         num_features = X_train_t.shape[1]
         num_classes = int(np.unique(y_train).shape[0])
@@ -201,8 +302,11 @@ def train_and_eval(
 
         X_val_t = X_val_t.to(device)
         y_val_t = y_val_t.to(device)
+        X_test_t = X_test_t.to(device)
+        y_test_t = y_test_t.to(device)
 
-        criterion = nn.CrossEntropyLoss()
+        weights = class_weight_tensor.to(device) if class_weight_tensor is not None else None
+        criterion = nn.CrossEntropyLoss(weight=weights)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
         epochs = 10
@@ -231,9 +335,9 @@ def train_and_eval(
         model.eval()
         with torch.no_grad():
             logits_val = model(X_val_t)
-            y_pred_t = torch.argmax(logits_val, dim=1)
-
-        y_pred = y_pred_t.cpu().numpy()
+            logits_test = model(X_test_t)
+            y_pred_val = torch.argmax(logits_val, dim=1).cpu().numpy()
+            y_pred_test = torch.argmax(logits_test, dim=1).cpu().numpy()
 
         params = {
             "type": "torch_mlp",
@@ -242,20 +346,24 @@ def train_and_eval(
             "epochs": epochs,
             "lr": 1e-3,
             "device": str(device),
+            "class_weights": weights.cpu().numpy().tolist() if weights is not None else None,
         }
 
     # ---- Two-Layer Feed-Forward Neural Network (PyTorch) ----
     elif model_name == "ffnn":
-        X_train = _maybe_dense(X_train, tag="[ffnn]")
-        X_val = _maybe_dense(X_val, tag="[ffnn]")
+        X_train_dense = _maybe_dense(X_train, tag="[ffnn]")
+        X_val_dense = _maybe_dense(X_val, tag="[ffnn]")
+        X_test_dense = _maybe_dense(X_test, tag="[ffnn]")
 
         device = _get_torch_device()
 
         # Convert to torch tensors
-        X_train_t = torch.from_numpy(X_train.astype(np.float32))
+        X_train_t = torch.from_numpy(X_train_dense.astype(np.float32))
         y_train_t = torch.from_numpy(y_train.astype(np.int64))
-        X_val_t = torch.from_numpy(X_val.astype(np.float32))
+        X_val_t = torch.from_numpy(X_val_dense.astype(np.float32))
         y_val_t = torch.from_numpy(y_val.astype(np.int64))
+        X_test_t = torch.from_numpy(X_test_dense.astype(np.float32))
+        y_test_t = torch.from_numpy(y_test.astype(np.int64))
 
         num_features = X_train_t.shape[1]
         num_classes = int(np.unique(y_train).shape[0])
@@ -290,8 +398,11 @@ def train_and_eval(
 
         X_val_t = X_val_t.to(device)
         y_val_t = y_val_t.to(device)
+        X_test_t = X_test_t.to(device)
+        y_test_t = y_test_t.to(device)
 
-        criterion = nn.CrossEntropyLoss()
+        weights = class_weight_tensor.to(device) if class_weight_tensor is not None else None
+        criterion = nn.CrossEntropyLoss(weight=weights)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
         epochs = 15
@@ -320,9 +431,9 @@ def train_and_eval(
         model.eval()
         with torch.no_grad():
             logits_val = model(X_val_t)
-            y_pred_t = torch.argmax(logits_val, dim=1)
-
-        y_pred = y_pred_t.cpu().numpy()
+            logits_test = model(X_test_t)
+            y_pred_val = torch.argmax(logits_val, dim=1).cpu().numpy()
+            y_pred_test = torch.argmax(logits_test, dim=1).cpu().numpy()
 
         params = {
             "type": "torch_ffnn",
@@ -332,43 +443,39 @@ def train_and_eval(
             "lr": 1e-3,
             "weight_decay": 1e-4,
             "device": str(device),
+            "class_weights": weights.cpu().numpy().tolist() if weights is not None else None,
         }
 
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
 
     # ---- Common metrics ----
-    acc = float(accuracy_score(y_val, y_pred))
-    macro_f1 = float(f1_score(y_val, y_pred, average="macro"))
-    p, r, f1s, support = precision_recall_fscore_support(
-        y_val, y_pred, labels=np.unique(y_val), zero_division=0
-    )
+    metrics_val, cm_val = build_metric_payload(y_val, y_pred_val, label_order)
+    metrics_test, cm_test = build_metric_payload(y_test, y_pred_test, label_order)
 
-    report = {
+    report_val = {
         "model": model_name,
+        "split": "val",
         "params": params,
         "train_time_sec": round(train_time, 3),
-        "metrics": {
-            "accuracy": acc,
-            "macro_f1": macro_f1,
-            "per_class": [
-                {
-                    "class": int(cls),
-                    "precision": float(pi),
-                    "recall": float(ri),
-                    "f1": float(fi),
-                    "support": int(si),
-                }
-                for cls, pi, ri, fi, si in zip(np.unique(y_val), p, r, f1s, support)
-            ],
-            "classification_report": classification_report(
-                y_val, y_pred, digits=4
-            ),
-        },
+        "metrics": metrics_val,
+    }
+    report_test = {
+        "model": model_name,
+        "split": "test",
+        "params": params,
+        "train_time_sec": round(train_time, 3),
+        "metrics": metrics_test,
     }
 
-    cm = confusion_matrix(y_val, y_pred, labels=np.unique(y_val))
-    return report, cm
+    preds = {
+        "y_val": y_val,
+        "y_pred_val": y_pred_val,
+        "y_test": y_test,
+        "y_pred_test": y_pred_test,
+    }
+
+    return report_val, cm_val, report_test, cm_test, preds
 
 
 # ---------- CLI ----------
@@ -398,8 +505,8 @@ def main():
     parser.add_argument(
         "--models",
         type=str,
-        default="logreg,linearsvc,mlp,ffnn",
-        help="Comma-separated: logreg,linearsvc,mlp,ffnn",
+        default="dummy,logreg,linearsvc,mlp,ffnn,rf",
+        help="Comma-separated model keys to run.",
     )
     parser.add_argument(
         "--class_weight",
@@ -414,18 +521,24 @@ def main():
     X_paths = meta["X_artifacts"]
     X_train_path = Path(X_paths["train"]["path"])
     X_val_path = Path(X_paths["val"]["path"])
-    y_train_path = Path(Path(args.meta).parent / "y_train.csv")
-    y_val_path = Path(Path(args.meta).parent / "y_val.csv")
+    X_test_path = Path(X_paths["test"]["path"])
+    y_base_dir = Path(args.meta).parent
+    y_train_path = Path(y_base_dir / "y_train.csv")
+    y_val_path = Path(y_base_dir / "y_val.csv")
+    y_test_path = Path(y_base_dir / "y_test.csv")
 
     # Load data
     X_train = _load_X(X_train_path)
     X_val = _load_X(X_val_path)
-    y_train = _load_y(y_train_path)
-    y_val = _load_y(y_val_path)
+    X_test = _load_X(X_test_path)
+    y_train = _load_y(y_train_path).astype(int)
+    y_val = _load_y(y_val_path).astype(int)
+    y_test = _load_y(y_test_path).astype(int)
 
     # Report dirs
     figures_dir = _ensure_dir(Path(args.reports_dir) / "figures")
-    json_dir = _ensure_dir(Path(args.reports_dir) / "baselines")
+    metrics_dir = _ensure_dir(Path(args.reports_dir) / "metrics")
+    preds_dir = _ensure_dir(Path(args.reports_dir) / "predictions")
 
     # Optional: capture split strategy from config
     split_info = {}
@@ -442,48 +555,84 @@ def main():
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     cw = None if (args.class_weight is None or args.class_weight.lower() == "none") else args.class_weight
 
-    labels = np.unique(y_val)
+    label_order = np.unique(np.concatenate([y_train, y_val, y_test]))
+    class_weight_tensor = compute_class_weights(y_train)
+
     summary_rows = []
 
     for m in models:
         print(f"[run] {m} …")
-        report, cm = train_and_eval(
+        torch_weights = class_weight_tensor if m in {"mlp", "ffnn"} else None
+        report_val, cm_val, report_test, cm_test, preds = train_and_eval(
             model_name=m,
             X_train=X_train,
             y_train=y_train,
             X_val=X_val,
             y_val=y_val,
+            X_test=X_test,
+            y_test=y_test,
             random_state=args.seed,
-            class_weight=cw if m in {"logreg", "linearsvc"} else None,
+            linear_class_weight=cw if m in {"logreg", "linearsvc"} else None,
+            class_weight_tensor=torch_weights,
+            label_order=label_order,
         )
-        report["split"] = split_info
+        report_val["split_info"] = split_info
+        report_test["split_info"] = split_info
 
-        # Save JSON
-        out_json = json_dir / f"{m}.json"
-        out_json.write_text(json.dumps(report, indent=2))
+        # Save metrics JSON
+        metrics_val_path = metrics_dir / f"{m}_val.json"
+        metrics_test_path = metrics_dir / f"{m}_test.json"
+        metrics_val_path.write_text(json.dumps(report_val, indent=2))
+        metrics_test_path.write_text(json.dumps(report_test, indent=2))
 
-        # Save normalized confusion matrix
+        # Save confusion matrices
         pretty = pretty_model_name(m)
-        out_png = figures_dir / f"cm_{m}.png"
+        cm_val_path = figures_dir / f"cm_{m}_val.png"
+        cm_test_path = figures_dir / f"cm_{m}_test.png"
         save_confusion_png(
-            cm, labels=labels, out_png=out_png, title=f"Confusion Matrix — {pretty}"
+            cm_val, labels=label_order, out_png=cm_val_path, title=f"{pretty} — Validation"
         )
+        save_confusion_png(
+            cm_test, labels=label_order, out_png=cm_test_path, title=f"{pretty} — Test"
+        )
+
+        # Save test predictions
+        preds_path = preds_dir / f"{m}_test_predictions.csv"
+        pd.DataFrame(
+            {
+                "y_true": preds["y_test"].astype(int),
+                "y_pred": preds["y_pred_test"].astype(int),
+            }
+        ).to_csv(preds_path, index=False)
 
         # Add to summary
         summary_rows.append(
             {
                 "model": m,
-                "accuracy": report["metrics"]["accuracy"],
-                "macro_f1": report["metrics"]["macro_f1"],
-                "json": str(out_json),
-                "cm_png": str(out_png),
+                "split": "val",
+                "accuracy": report_val["metrics"]["accuracy"],
+                "macro_f1": report_val["metrics"]["macro_f1"],
+                "metrics_json": str(metrics_val_path),
+                "cm_png": str(cm_val_path),
+                "predictions_csv": "",
+            }
+        )
+        summary_rows.append(
+            {
+                "model": m,
+                "split": "test",
+                "accuracy": report_test["metrics"]["accuracy"],
+                "macro_f1": report_test["metrics"]["macro_f1"],
+                "metrics_json": str(metrics_test_path),
+                "cm_png": str(cm_test_path),
+                "predictions_csv": str(preds_path),
             }
         )
 
     # Write summary CSV
-    pd.DataFrame(summary_rows).sort_values(
-        "macro_f1", ascending=False
-    ).to_csv(Path(args.reports_dir) / "baselines_summary.csv", index=False)
+    pd.DataFrame(summary_rows).to_csv(
+        Path(args.reports_dir) / "baselines_summary.csv", index=False
+    )
     print(f"[done] Wrote reports to: {args.reports_dir}")
 
 
