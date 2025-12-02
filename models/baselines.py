@@ -81,11 +81,22 @@ def _get_torch_device():
 
 # ---------- Class imbalance helpers ----------
 
-def compute_class_weights(y: np.ndarray) -> torch.Tensor:
-    """Compute inverse-frequency weights for CrossEntropyLoss."""
+def compute_class_weights(y: np.ndarray, label_order: np.ndarray | None = None) -> torch.Tensor:
+    """Compute inverse-frequency weights aligned with label_order (or y's unique labels)."""
     labels, counts = np.unique(y, return_counts=True)
     counts = counts.astype(np.float32)
-    weights = counts.sum() / (len(labels) * counts)
+    if label_order is None:
+        label_order = labels
+    total = counts.sum()
+    num_classes = len(label_order)
+    count_map = {int(lbl): float(cnt) for lbl, cnt in zip(labels, counts)}
+    weights = []
+    for lbl in label_order:
+        c = count_map.get(int(lbl), 0.0)
+        if c == 0.0:
+            weights.append(0.0)
+        else:
+            weights.append(total / (num_classes * c))
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -167,6 +178,11 @@ def train_and_eval(
     label_order: np.ndarray | None,
 ) -> Tuple[Dict, np.ndarray, Dict, np.ndarray, Dict[str, np.ndarray]]:
     """Train model and return metrics for validation + test splits."""
+
+    if label_order is None:
+        label_order = np.unique(y_train)
+    label_order = np.asarray(label_order, dtype=int)
+    label_to_idx = {int(lbl): idx for idx, lbl in enumerate(label_order)}
 
     params: Dict = {}
     y_pred_val: np.ndarray
@@ -269,16 +285,21 @@ def train_and_eval(
 
         device = _get_torch_device()
 
+        # Map labels to contiguous indices
+        y_train_idx = np.vectorize(label_to_idx.get)(y_train)
+        y_val_idx = np.vectorize(label_to_idx.get)(y_val)
+        y_test_idx = np.vectorize(label_to_idx.get)(y_test)
+
         # Convert to torch tensors
         X_train_t = torch.from_numpy(X_train_dense.astype(np.float32))
-        y_train_t = torch.from_numpy(y_train.astype(np.int64))
+        y_train_t = torch.from_numpy(y_train_idx.astype(np.int64))
         X_val_t = torch.from_numpy(X_val_dense.astype(np.float32))
-        y_val_t = torch.from_numpy(y_val.astype(np.int64))
+        y_val_t = torch.from_numpy(y_val_idx.astype(np.int64))
         X_test_t = torch.from_numpy(X_test_dense.astype(np.float32))
-        y_test_t = torch.from_numpy(y_test.astype(np.int64))
+        y_test_t = torch.from_numpy(y_test_idx.astype(np.int64))
 
         num_features = X_train_t.shape[1]
-        num_classes = int(np.unique(y_train).shape[0])
+        num_classes = len(label_order)
 
         class MLP(nn.Module):
             def __init__(self, in_dim, hidden_dim, out_dim):
@@ -336,8 +357,10 @@ def train_and_eval(
         with torch.no_grad():
             logits_val = model(X_val_t)
             logits_test = model(X_test_t)
-            y_pred_val = torch.argmax(logits_val, dim=1).cpu().numpy()
-            y_pred_test = torch.argmax(logits_test, dim=1).cpu().numpy()
+            y_pred_val_idx = torch.argmax(logits_val, dim=1).cpu().numpy()
+            y_pred_test_idx = torch.argmax(logits_test, dim=1).cpu().numpy()
+            y_pred_val = label_order[y_pred_val_idx]
+            y_pred_test = label_order[y_pred_test_idx]
 
         params = {
             "type": "torch_mlp",
@@ -357,16 +380,21 @@ def train_and_eval(
 
         device = _get_torch_device()
 
+        # Map labels to contiguous indices
+        y_train_idx = np.vectorize(label_to_idx.get)(y_train)
+        y_val_idx = np.vectorize(label_to_idx.get)(y_val)
+        y_test_idx = np.vectorize(label_to_idx.get)(y_test)
+
         # Convert to torch tensors
         X_train_t = torch.from_numpy(X_train_dense.astype(np.float32))
-        y_train_t = torch.from_numpy(y_train.astype(np.int64))
+        y_train_t = torch.from_numpy(y_train_idx.astype(np.int64))
         X_val_t = torch.from_numpy(X_val_dense.astype(np.float32))
-        y_val_t = torch.from_numpy(y_val.astype(np.int64))
+        y_val_t = torch.from_numpy(y_val_idx.astype(np.int64))
         X_test_t = torch.from_numpy(X_test_dense.astype(np.float32))
-        y_test_t = torch.from_numpy(y_test.astype(np.int64))
+        y_test_t = torch.from_numpy(y_test_idx.astype(np.int64))
 
         num_features = X_train_t.shape[1]
-        num_classes = int(np.unique(y_train).shape[0])
+        num_classes = len(label_order)
 
         class FeedForwardNN(nn.Module):
             def __init__(self, in_dim, hidden1, hidden2, out_dim):
@@ -432,8 +460,10 @@ def train_and_eval(
         with torch.no_grad():
             logits_val = model(X_val_t)
             logits_test = model(X_test_t)
-            y_pred_val = torch.argmax(logits_val, dim=1).cpu().numpy()
-            y_pred_test = torch.argmax(logits_test, dim=1).cpu().numpy()
+            y_pred_val_idx = torch.argmax(logits_val, dim=1).cpu().numpy()
+            y_pred_test_idx = torch.argmax(logits_test, dim=1).cpu().numpy()
+            y_pred_val = label_order[y_pred_val_idx]
+            y_pred_test = label_order[y_pred_test_idx]
 
         params = {
             "type": "torch_ffnn",
@@ -556,7 +586,7 @@ def main():
     cw = None if (args.class_weight is None or args.class_weight.lower() == "none") else args.class_weight
 
     label_order = np.unique(np.concatenate([y_train, y_val, y_test]))
-    class_weight_tensor = compute_class_weights(y_train)
+    class_weight_tensor = compute_class_weights(y_train, label_order=label_order)
 
     summary_rows = []
 
