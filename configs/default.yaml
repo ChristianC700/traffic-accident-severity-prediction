@@ -40,9 +40,13 @@ cyclical_encode: true              # sin/cos encoding
 max_missing_col_fraction: 0.6
 drop_rows_with_missing_target: true
 
-# smaller sample to start
-sample_n_rows: 100000      # try 100k first; bump later
+# Data sampling
+sample_n_rows: null        # Ignored when samples_per_class is set
 sample_fraction: null
+data_sampling:
+  minority_oversample: true  # Enable balanced class sampling
+  samples_per_class: {1: 30000, 2: 30000, 3: 30000, 4: 30000}  # Target count per class (stops early when met)
+  majority_sample_fraction: 1.0  # Legacy parameter (not used when samples_per_class is set)
 
 
 # Split
@@ -57,3 +61,66 @@ ohe_min_freq: 20           # bucket rare categories; reduces OHE width
 # IO/perf
 use_arrow: true
 n_jobs: -1
+
+# Resampling (applied to training set only)
+# DISABLED: Dataset is already balanced (30k per class), so resampling is unnecessary
+resampling:
+  method: null  # null, "smote", "adasyn", "borderline_smote" - set to null for balanced datasets
+  k_neighbors: 3
+  apply_to: "train_only"
+  sampling_strategy: "auto"  # "auto", "minority", float (e.g., 0.5), or dict (e.g., {1: 50000, 4: 50000} for target counts)
+
+# Class merging
+merge_classes:
+  enabled: false
+  mapping: {1: 2, 4: 3}  # merge 1→2, 4→3
+
+# Class weights and focal loss
+# DISABLED: Dataset is already balanced, so focal loss and class weights are unnecessary
+# (inverse_freq/balanced will compute equal weights anyway with balanced data)
+class_weights:
+  strategy: "uniform"  # inverse_freq, balanced, uniform - "uniform" explicitly shows equal weights
+  focal_loss_gamma: null  # null to disable, or set to 2.0 for focal loss - disabled for balanced datasets
+
+# Logistic Regression optimization
+logreg:
+  solver: "auto"  # auto, saga, lbfgs, liblinear
+  max_iter: 1000
+  tol: 1e-4
+
+# Hyperparameter tuning
+hyperparameter_tuning:
+  linearsvc:
+    enabled: false
+    method: "grid"  # grid or random
+    cv_folds: 3
+  rf:
+    enabled: false
+    n_iter: 20
+    cv_folds: 3
+
+# MLP configuration
+mlp:
+  hidden_dims: [256, 128]  # list of layer sizes
+  dropout: 0.3
+  activation: "relu"  # relu, gelu, swish
+  batch_norm: true
+  batch_size: 1024
+  epochs: 15
+  lr: 0.001
+  weight_decay: 0.0001
+  balanced_sampling: false  # use WeightedRandomSampler - DISABLED: dataset is already balanced
+  lr_schedule: "plateau"  # plateau, cosine, none
+  early_stopping:
+    enabled: true
+    patience: 5
+    min_delta: 0.001
+
+# Cost-sensitive learning
+cost_matrix:
+  enabled: false
+  # Cost of predicting class i when true is class j (rows=true, cols=pred)
+  matrix: [[0, 1, 2, 10],   # true=1: cost of predicting 1,2,3,4
+           [1, 0, 1, 5],    # true=2
+           [2, 1, 0, 3],    # true=3
+           [10, 5, 3, 0]]   # true=4
