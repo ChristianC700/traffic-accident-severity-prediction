@@ -18,6 +18,7 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from .config import PreprocessConfig
 from .utils import ensure_dir, read_csv_fast, save_json, to_parquet, to_csv_series
+from .resample import apply_resampling
 
 @dataclass
 class DatasetSplits:
@@ -123,6 +124,11 @@ def select_and_engineer(df: pd.DataFrame, cfg: PreprocessConfig) -> Tuple[pd.Dat
     # Split features / target
     y = df[cfg.target_column].copy()
     X = df.drop(columns=[cfg.target_column])
+    
+    # Apply class merging if enabled
+    if cfg.merge_classes and cfg.merge_classes.get("enabled", False):
+        mapping = cfg.merge_classes.get("mapping", {1: 2, 4: 3})
+        y = y.replace(mapping)
 
     # Numeric / Categorical separation
     num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
@@ -167,10 +173,33 @@ def fit_transform_and_save(
     transformer: ColumnTransformer,
     out_paths: dict,
     reports_dir: Path,
+    cfg: PreprocessConfig,
 ) -> None:
     X_train_tf = transformer.fit_transform(splits.X_train)
     X_val_tf = transformer.transform(splits.X_val)
     X_test_tf = transformer.transform(splits.X_test)
+    
+    # Apply resampling to training set only if configured
+    # NOTE: Resampling is typically disabled for balanced datasets (method: null in config)
+    # With balanced class sampling (30k per class), SMOTE/ADASYN are unnecessary
+    resampling_cfg = cfg.resampling or {}
+    resampling_method = resampling_cfg.get("method")
+    if resampling_method:
+        k_neighbors = resampling_cfg.get("k_neighbors", 5)
+        n_jobs = cfg.n_jobs
+        sampling_strategy = resampling_cfg.get("sampling_strategy", "auto")
+        print(f"[resample] Applying {resampling_method} to training set...")
+        X_train_tf, y_train_resampled = apply_resampling(
+            X_train_tf,
+            splits.y_train,
+            method=resampling_method,
+            k_neighbors=k_neighbors,
+            random_state=cfg.random_state,
+            n_jobs=n_jobs,
+            sampling_strategy=sampling_strategy,
+        )
+        splits.y_train = y_train_resampled
+        print(f"[resample] Training set size after resampling: {X_train_tf.shape[0]} samples")
 
     # Feature names
     feature_names: List[str] = []
@@ -208,14 +237,16 @@ def fit_transform_and_save(
     # Persist pipeline and metadata
     joblib.dump(transformer, out_paths["pipeline"])
     save_json({"feature_names": feature_names}, out_paths["features"])
-    save_json(
-        {
-            "created_at": datetime.utcnow().isoformat(),
-            "rows": {"train": int(splits.X_train.shape[0]), "val": int(splits.X_val.shape[0]), "test": int(splits.X_test.shape[0])},
-            "X_artifacts": meta_x,
-        },
-        out_paths["meta"],
-    )
+    
+    # Include resampling and class merging info in metadata
+    meta_data = {
+        "created_at": datetime.utcnow().isoformat(),
+        "rows": {"train": int(len(splits.y_train)), "val": int(splits.X_val.shape[0]), "test": int(splits.X_test.shape[0])},
+        "X_artifacts": meta_x,
+        "resampling": resampling_cfg,
+        "merge_classes": cfg.merge_classes or {},
+    }
+    save_json(meta_data, out_paths["meta"])
 
 
 def run_preprocess(config_path: str | Path) -> None:
@@ -223,9 +254,47 @@ def run_preprocess(config_path: str | Path) -> None:
     ensure_dir(cfg.output_dir)
     ensure_dir(cfg.reports_dir)
 
-    # Sampling toggles for feasibility on 7M+ rows (proposal uses ~1M subset)
-    n_rows = cfg.sample_n_rows if cfg.sample_n_rows else None
-    df = read_csv_fast(cfg.raw_csv_path, use_arrow=cfg.use_arrow, n_rows=n_rows)
+    # Check if we should use balanced class sampling
+    data_sampling_cfg = cfg.data_sampling or {}
+    minority_oversample = data_sampling_cfg.get("minority_oversample", False)
+    samples_per_class = data_sampling_cfg.get("samples_per_class", None)
+    
+    if minority_oversample and samples_per_class:
+        # Load with balanced class sampling - collects specified count per class
+        # This stops early once all class targets are met
+        df = read_csv_fast(
+            cfg.raw_csv_path,
+            use_arrow=cfg.use_arrow,
+            n_rows=None,  # Ignored when samples_per_class is set
+            target_col=cfg.target_column,
+            samples_per_class=samples_per_class,
+            random_state=cfg.random_state
+        )
+    elif minority_oversample:
+        # Legacy behavior: collect all minority classes (for backward compatibility)
+        df = read_csv_fast(
+            cfg.raw_csv_path,
+            use_arrow=cfg.use_arrow,
+            n_rows=None,
+            target_col=cfg.target_column,
+            minority_classes=[1, 4],  # Collect all samples of these classes
+            random_state=cfg.random_state
+        )
+        # If sample_n_rows is set, keep all minority, sample from majority
+        if cfg.sample_n_rows and len(df) > cfg.sample_n_rows:
+            minority = df[df[cfg.target_column].isin([1, 4])]
+            majority = df[~df[cfg.target_column].isin([1, 4])]
+            n_needed = cfg.sample_n_rows - len(minority)
+            if n_needed > 0:
+                majority = majority.sample(n=min(n_needed, len(majority)), random_state=cfg.random_state)
+            df = pd.concat([minority, majority], ignore_index=True)
+            df = df.sample(frac=1.0, random_state=cfg.random_state).reset_index(drop=True)
+            print(f"[preprocess] Final dataset after limiting: {len(df):,} rows")
+    else:
+        # Original behavior: simple random sampling
+        n_rows = cfg.sample_n_rows if cfg.sample_n_rows else None
+        df = read_csv_fast(cfg.raw_csv_path, use_arrow=cfg.use_arrow, n_rows=n_rows)
+    
     if cfg.sample_fraction is not None:
         df = df.sample(frac=cfg.sample_fraction, random_state=cfg.random_state)
 
@@ -236,4 +305,4 @@ def run_preprocess(config_path: str | Path) -> None:
 
     splits = split_data(X, y, cfg)
     transformer = build_transformer(num_cols, cat_cols, cfg.scale_numeric, cfg.ohe_min_freq)
-    fit_transform_and_save(splits, transformer, cfg.output_paths(), Path(cfg.reports_dir))
+    fit_transform_and_save(splits, transformer, cfg.output_paths(), Path(cfg.reports_dir), cfg)

@@ -36,6 +36,25 @@ class PreprocessConfig(BaseModel):
     use_arrow: bool = True
     n_jobs: int = -1
 
+    # Resampling configuration
+    resampling: Optional[Dict] = Field(default_factory=lambda: {
+        "method": None,
+        "k_neighbors": 5,
+        "apply_to": "train_only"
+    })
+
+    # Data sampling configuration
+    data_sampling: Optional[Dict] = Field(default_factory=lambda: {
+        "minority_oversample": False,
+        "majority_sample_fraction": 1.0
+    })
+
+    # Class merging configuration
+    merge_classes: Optional[Dict] = Field(default_factory=lambda: {
+        "enabled": False,
+        "mapping": {1: 2, 4: 3}
+    })
+
     @validator("max_missing_col_fraction")
     def _range(cls, v):
         if not (0.0 <= v <= 1.0): raise ValueError("max_missing_col_fraction must be in [0,1]")

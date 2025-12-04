@@ -11,6 +11,7 @@ Saves:
 
 from __future__ import annotations
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
@@ -22,7 +23,6 @@ from scipy.sparse import load_npz, issparse
 
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -30,8 +30,14 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     ConfusionMatrixDisplay,
+    cohen_kappa_score,
+    matthews_corrcoef,
+    balanced_accuracy_score,
+    roc_auc_score,
+    top_k_accuracy_score,
 )
 from sklearn.svm import LinearSVC
+from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 
 import matplotlib.pyplot as plt
 import yaml
@@ -79,24 +85,99 @@ def _get_torch_device():
         return torch.device("cpu")
 
 
+def _cleanup_memory():
+    """Clear PyTorch caches and force garbage collection."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
 # ---------- Class imbalance helpers ----------
 
-def compute_class_weights(y: np.ndarray, label_order: np.ndarray | None = None) -> torch.Tensor:
-    """Compute inverse-frequency weights aligned with label_order (or y's unique labels)."""
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing class imbalance.
+    
+    Focal Loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    where p_t is the predicted probability for the true class.
+    """
+    def __init__(self, alpha: torch.Tensor | None = None, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.alpha = alpha  # class weights tensor
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = nn.functional.cross_entropy(inputs, targets, weight=self.alpha, reduction="none")
+        pt = torch.exp(-ce_loss)  # probability of true class
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            # Apply alpha weighting
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+            
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+def compute_class_weights(
+    y: np.ndarray, 
+    label_order: np.ndarray | None = None,
+    strategy: str = "inverse_freq"
+) -> torch.Tensor:
+    """
+    Compute class weights using different strategies.
+    
+    Args:
+        y: Array of labels
+        label_order: Ordered list of unique labels
+        strategy: "inverse_freq", "balanced", or "uniform"
+        
+    Returns:
+        Tensor of class weights aligned with label_order
+    """
     labels, counts = np.unique(y, return_counts=True)
     counts = counts.astype(np.float32)
     if label_order is None:
         label_order = labels
-    total = counts.sum()
-    num_classes = len(label_order)
+    else:
+        label_order = np.asarray(label_order)
+    
     count_map = {int(lbl): float(cnt) for lbl, cnt in zip(labels, counts)}
     weights = []
-    for lbl in label_order:
-        c = count_map.get(int(lbl), 0.0)
-        if c == 0.0:
-            weights.append(0.0)
-        else:
-            weights.append(total / (num_classes * c))
+    
+    if strategy == "inverse_freq":
+        # Inverse frequency weighting (current default)
+        total = counts.sum()
+        num_classes = len(label_order)
+        for lbl in label_order:
+            c = count_map.get(int(lbl), 0.0)
+            if c == 0.0:
+                weights.append(0.0)
+            else:
+                weights.append(total / (num_classes * c))
+    elif strategy == "balanced":
+        # sklearn-style balanced weights
+        total = counts.sum()
+        num_classes = len(label_order)
+        for lbl in label_order:
+            c = count_map.get(int(lbl), 0.0)
+            if c == 0.0:
+                weights.append(0.0)
+            else:
+                weights.append(total / (num_classes * c))
+    elif strategy == "uniform":
+        # Uniform weights (no weighting)
+        weights = [1.0] * len(label_order)
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}. Choose from: inverse_freq, balanced, uniform")
+    
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -114,18 +195,73 @@ def pretty_model_name(key: str) -> str:
     }.get(key, key)
 
 
-def build_metric_payload(y_true, y_pred, label_order: np.ndarray | None = None):
-    """Return metrics dict + confusion matrix for the provided split."""
+def compute_cost(y_true, y_pred, cost_matrix: np.ndarray | None = None, label_order: np.ndarray | None = None):
+    """Compute total cost given a cost matrix."""
+    if cost_matrix is None:
+        return None
+    
+    if label_order is None:
+        label_order = np.unique(np.concatenate([y_true, y_pred]))
+    
+    total_cost = 0.0
+    for true_cls, pred_cls in zip(y_true, y_pred):
+        true_idx = np.where(label_order == true_cls)[0][0]
+        pred_idx = np.where(label_order == pred_cls)[0][0]
+        total_cost += cost_matrix[true_idx, pred_idx]
+    
+    return total_cost
+
+
+def build_metric_payload(y_true, y_pred, label_order: np.ndarray | None = None, y_proba: np.ndarray | None = None, cost_matrix: np.ndarray | None = None):
+    """Return metrics dict + confusion matrix for the provided split.
+    
+    Args:
+        y_true: True labels
+        y_pred: Predicted labels
+        label_order: Ordered list of unique labels
+        y_proba: Predicted probabilities (optional, for AUC computation)
+    """
     if label_order is None:
         label_order = np.unique(y_true)
+    label_order = np.asarray(label_order, dtype=int)
+    
     acc = float(accuracy_score(y_true, y_pred))
     macro_f1 = float(f1_score(y_true, y_pred, average="macro"))
+    balanced_acc = float(balanced_accuracy_score(y_true, y_pred))
+    kappa = float(cohen_kappa_score(y_true, y_pred))
+    mcc = float(matthews_corrcoef(y_true, y_pred))
+    
     precision, recall, f1s, support = precision_recall_fscore_support(
         y_true, y_pred, labels=label_order, zero_division=0
     )
+    
+    # Per-class AUC (one-vs-rest) if probabilities available
+    per_class_auc = {}
+    if y_proba is not None and y_proba.shape[1] == len(label_order):
+        try:
+            # Convert labels to binary for each class
+            for i, cls in enumerate(label_order):
+                y_binary = (y_true == cls).astype(int)
+                if len(np.unique(y_binary)) > 1:  # Need both classes present
+                    per_class_auc[int(cls)] = float(roc_auc_score(y_binary, y_proba[:, i]))
+        except Exception:
+            pass  # Skip AUC if computation fails
+    
+    # Top-2 accuracy
+    top2_acc = None
+    if y_proba is not None:
+        try:
+            top2_acc = float(top_k_accuracy_score(y_true, y_proba, k=2, labels=label_order))
+        except Exception:
+            pass
+    
     metrics = {
         "accuracy": acc,
+        "balanced_accuracy": balanced_acc,
         "macro_f1": macro_f1,
+        "cohens_kappa": kappa,
+        "matthews_corrcoef": mcc,
+        "top2_accuracy": top2_acc,
         "per_class": [
             {
                 "class": int(cls),
@@ -133,13 +269,22 @@ def build_metric_payload(y_true, y_pred, label_order: np.ndarray | None = None):
                 "recall": float(ri),
                 "f1": float(fi),
                 "support": int(si),
+                "auc": per_class_auc.get(int(cls), None),
             }
             for cls, pi, ri, fi, si in zip(label_order, precision, recall, f1s, support)
         ],
+        "per_class_auc": per_class_auc,
         "classification_report": classification_report(
             y_true, y_pred, labels=label_order, digits=4
         ),
     }
+    
+    # Cost-sensitive evaluation
+    if cost_matrix is not None:
+        total_cost = compute_cost(y_true, y_pred, cost_matrix, label_order)
+        metrics["total_cost"] = total_cost
+        metrics["average_cost"] = total_cost / len(y_true) if len(y_true) > 0 else 0.0
+    
     cm = confusion_matrix(y_true, y_pred, labels=label_order)
     return metrics, cm
 
@@ -176,6 +321,17 @@ def train_and_eval(
     linear_class_weight: str | None,
     class_weight_tensor: torch.Tensor | None,
     label_order: np.ndarray | None,
+    focal_loss_gamma: float | None = None,
+    logreg_solver: str = "auto",
+    logreg_max_iter: int = 1000,
+    logreg_tol: float = 1e-4,
+    tune_linearsvc: bool = False,
+    linearsvc_cv_folds: int = 3,
+    tune_rf: bool = False,
+    rf_n_iter: int = 20,
+    rf_cv_folds: int = 3,
+    mlp_config: Dict | None = None,
+    cost_matrix: np.ndarray | None = None,
 ) -> Tuple[Dict, np.ndarray, Dict, np.ndarray, Dict[str, np.ndarray]]:
     """Train model and return metrics for validation + test splits."""
 
@@ -204,78 +360,282 @@ def train_and_eval(
         y_pred_val = clf.predict(dummy_val)
         y_pred_test = clf.predict(dummy_test)
 
-    # ---- Logistic Regression ----
+    # ---- Logistic Regression (PyTorch GPU-accelerated) ----
     elif model_name == "logreg":
-        clf = LogisticRegression(
-            solver="saga",
-            penalty="l2",
-            C=0.1,
-            max_iter=5000,
-            tol=1e-3,
-            random_state=random_state,
-            class_weight=linear_class_weight,
-            n_jobs=-1,
-        )
-        params = {
-            "solver": "saga",
-            "penalty": "l2",
-            "max_iter": 5000,
-            "tol": 1e-3,
-            "class_weight": linear_class_weight,
-            "random_state": random_state,
-            "n_jobs": -1,
-        }
+        X_train_dense = _maybe_dense(X_train, tag="[logreg]")
+        X_val_dense = _maybe_dense(X_val, tag="[logreg]")
+        X_test_dense = _maybe_dense(X_test, tag="[logreg]")
+
+        device = _get_torch_device()
+        
+        # Set random seed for reproducibility
+        torch.manual_seed(random_state)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(random_state)
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            # MPS doesn't have manual_seed, but we set CPU seed which should be sufficient
+            pass
+
+        # Map labels to contiguous indices
+        y_train_idx = np.vectorize(label_to_idx.get)(y_train)
+        y_val_idx = np.vectorize(label_to_idx.get)(y_val)
+        y_test_idx = np.vectorize(label_to_idx.get)(y_test)
+
+        # Convert to torch tensors
+        X_train_t = torch.from_numpy(X_train_dense.astype(np.float32))
+        y_train_t = torch.from_numpy(y_train_idx.astype(np.int64))
+        X_val_t = torch.from_numpy(X_val_dense.astype(np.float32))
+        y_val_t = torch.from_numpy(y_val_idx.astype(np.int64))
+        X_test_t = torch.from_numpy(X_test_dense.astype(np.float32))
+        y_test_t = torch.from_numpy(y_test_idx.astype(np.int64))
+
+        num_features = X_train_t.shape[1]
+        num_classes = len(label_order)
+
+        # Simple linear layer (logistic regression = linear layer + softmax)
+        class LogisticRegressionTorch(nn.Module):
+            def __init__(self, in_dim, out_dim):
+                super().__init__()
+                self.linear = nn.Linear(in_dim, out_dim)
+            
+            def forward(self, x):
+                return self.linear(x)
+
+        model = LogisticRegressionTorch(num_features, num_classes).to(device)
+
+        # Use class weights if provided (from class_weight_tensor)
+        weights = class_weight_tensor.to(device) if class_weight_tensor is not None else None
+        criterion = nn.CrossEntropyLoss(weight=weights)
+
+        # Adam optimizer with L2 regularization (weight_decay=0.1 equivalent to C=0.1 in sklearn)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=0.1)
+
+        # Batch size for GPU efficiency
+        batch_size = 4096
+        train_ds = TensorDataset(X_train_t, y_train_t)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+        # Move validation and test data to device
+        X_val_t = X_val_t.to(device)
+        y_val_t = y_val_t.to(device)
+        X_test_t = X_test_t.to(device)
+        y_test_t = y_test_t.to(device)
+
+        print(f"[logreg] Data prepared: train={X_train_t.shape}, val={X_val_t.shape}, test={X_test_t.shape}")
+        print(f"[logreg] Starting training for up to {logreg_max_iter} epochs...")
+
+        # Training with early stopping based on tolerance
+        max_epochs = logreg_max_iter
+        best_val_loss = float('inf')
+        patience_counter = 0
+        patience_threshold = 3  # Stop if no improvement for 3 epochs
+        best_model_state = None
 
         t0 = time.time()
-        clf.fit(X_train, y_train)
+        model.train()
+        for epoch in range(max_epochs):
+            epoch_loss = 0.0
+            for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+
+                optimizer.zero_grad()
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * xb.size(0)
+
+            avg_loss = epoch_loss / len(train_ds)
+            
+            # Check validation loss for early stopping
+            model.eval()
+            with torch.no_grad():
+                val_logits = model(X_val_t)
+                val_loss = criterion(val_logits, y_val_t).item()
+            model.train()
+            
+            # Early stopping based on tolerance
+            if val_loss < best_val_loss - logreg_tol:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_model_state = model.state_dict().copy()
+            else:
+                patience_counter += 1
+                if patience_counter >= patience_threshold:
+                    print(f"[logreg] Early stopping at epoch {epoch+1} (loss change < {logreg_tol})")
+                    if best_model_state is not None:
+                        model.load_state_dict(best_model_state)
+                    break
+            
+            if (epoch + 1) % 10 == 0:
+                print(f"[logreg] Epoch {epoch+1}/{max_epochs} - train_loss={avg_loss:.4f}, val_loss={val_loss:.4f}")
+            elif epoch == 0:
+                print(f"[logreg] Epoch 1/{max_epochs} - train_loss={avg_loss:.4f}, val_loss={val_loss:.4f}")
+
         train_time = time.time() - t0
 
-        y_pred_val = clf.predict(X_val)
-        y_pred_test = clf.predict(X_test)
+        # Evaluation
+        model.eval()
+        with torch.no_grad():
+            logits_val = model(X_val_t)
+            logits_test = model(X_test_t)
+            y_proba_val = torch.softmax(logits_val, dim=1).cpu().numpy()
+            y_proba_test = torch.softmax(logits_test, dim=1).cpu().numpy()
+            y_pred_val_idx = torch.argmax(logits_val, dim=1).cpu().numpy()
+            y_pred_test_idx = torch.argmax(logits_test, dim=1).cpu().numpy()
+            y_pred_val = label_order[y_pred_val_idx]
+            y_pred_test = label_order[y_pred_test_idx]
+
+        params = {
+            "type": "torch_logreg",
+            "device": str(device),
+            "batch_size": batch_size,
+            "max_epochs": max_epochs,
+            "lr": 0.01,
+            "weight_decay": 0.1,
+            "tol": logreg_tol,
+            "class_weights": weights.cpu().numpy().tolist() if weights is not None else None,
+            "random_state": random_state,
+        }
+        
+        # Cleanup: delete dense arrays and tensors
+        del X_train_dense, X_val_dense, X_test_dense
+        del X_train_t, X_val_t, X_test_t, y_train_t, y_val_t, y_test_t
+        del model, optimizer, train_loader, train_ds
+        _cleanup_memory()
 
     # ---- Linear SVM ----
     elif model_name == "linearsvc":
-        clf = LinearSVC(
-            random_state=random_state,
-            class_weight=linear_class_weight,
-        )
-        params = {
-            "class_weight": linear_class_weight,
-            "random_state": random_state,
-        }
-
-        t0 = time.time()
-        clf.fit(X_train, y_train)
-        train_time = time.time() - t0
+        if tune_linearsvc:
+            # Hyperparameter grid for LinearSVC
+            param_grid = {
+                'C': [0.01, 0.1, 1.0, 10.0, 100.0],
+                'loss': ['hinge', 'squared_hinge'],
+                'max_iter': [1000, 5000, 10000],
+            }
+            base_clf = LinearSVC(
+                random_state=random_state,
+                class_weight=linear_class_weight,
+                dual=False,  # False for n_samples > n_features
+            )
+            print(f"[linearsvc] Running GridSearchCV with {linearsvc_cv_folds}-fold CV...")
+            t0 = time.time()
+            clf = GridSearchCV(
+                base_clf,
+                param_grid,
+                cv=linearsvc_cv_folds,
+                scoring='f1_macro',
+                n_jobs=-1,
+                verbose=1,
+            )
+            clf.fit(X_train, y_train)
+            train_time = time.time() - t0
+            print(f"[linearsvc] Best params: {clf.best_params_}")
+            params = {
+                "best_params": clf.best_params_,
+                "best_score": float(clf.best_score_),
+                "class_weight": linear_class_weight,
+                "random_state": random_state,
+            }
+            clf = clf.best_estimator_
+        else:
+            clf = LinearSVC(
+                random_state=random_state,
+                class_weight=linear_class_weight,
+                max_iter=1000,  # Prevent infinite runs
+                dual=False,  # Efficient for sparse data when n_samples > n_features
+            )
+            params = {
+                "class_weight": linear_class_weight,
+                "max_iter": 1000,
+                "dual": False,
+                "random_state": random_state,
+            }
+            t0 = time.time()
+            clf.fit(X_train, y_train)
+            train_time = time.time() - t0
 
         y_pred_val = clf.predict(X_val)
         y_pred_test = clf.predict(X_test)
+        # Get probabilities for AUC if available
+        # LinearSVC doesn't support predict_proba, use decision_function for scores
+        if hasattr(clf, 'predict_proba'):
+            y_proba_val = clf.predict_proba(X_val)
+            y_proba_test = clf.predict_proba(X_test)
+        else:
+            # LinearSVC only has decision_function, not predict_proba
+            y_proba_val = None
+            y_proba_test = None
 
     # ---- Random Forest ----
     elif model_name == "rf":
-        clf = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=20,
-            min_samples_leaf=5,
-            class_weight="balanced",
-            n_jobs=-1,
-            random_state=random_state,
-        )
-        params = {
-            "n_estimators": 300,
-            "max_depth": 20,
-            "min_samples_leaf": 5,
-            "class_weight": "balanced",
-            "n_jobs": -1,
-            "random_state": random_state,
-        }
-
-        t0 = time.time()
-        clf.fit(X_train, y_train)
-        train_time = time.time() - t0
+        if tune_rf:
+            # Hyperparameter distribution for RandomizedSearchCV
+            param_dist = {
+                'n_estimators': [200, 300, 500, 1000],
+                'max_depth': [10, 15, 20, 25, None],
+                'min_samples_split': [2, 5, 10],
+                'min_samples_leaf': [1, 2, 5],
+                'max_features': ['sqrt', 'log2', 0.3, 0.5],
+                'class_weight': ['balanced', 'balanced_subsample'],
+            }
+            base_clf = RandomForestClassifier(
+                n_jobs=-1,
+                random_state=random_state,
+            )
+            print(f"[rf] Running RandomizedSearchCV with {rf_n_iter} iterations, {rf_cv_folds}-fold CV...")
+            t0 = time.time()
+            clf = RandomizedSearchCV(
+                base_clf,
+                param_dist,
+                n_iter=rf_n_iter,
+                cv=rf_cv_folds,
+                scoring='f1_macro',
+                n_jobs=-1,
+                random_state=random_state,
+                verbose=1,
+            )
+            clf.fit(X_train, y_train)
+            train_time = time.time() - t0
+            print(f"[rf] Best params: {clf.best_params_}")
+            params = {
+                "best_params": clf.best_params_,
+                "best_score": float(clf.best_score_),
+                "n_jobs": -1,
+                "random_state": random_state,
+            }
+            clf = clf.best_estimator_
+        else:
+            clf = RandomForestClassifier(
+                n_estimators=300,
+                max_depth=20,
+                min_samples_leaf=5,
+                class_weight="balanced",
+                n_jobs=-1,
+                random_state=random_state,
+            )
+            params = {
+                "n_estimators": 300,
+                "max_depth": 20,
+                "min_samples_leaf": 5,
+                "class_weight": "balanced",
+                "n_jobs": -1,
+                "random_state": random_state,
+            }
+            t0 = time.time()
+            clf.fit(X_train, y_train)
+            train_time = time.time() - t0
 
         y_pred_val = clf.predict(X_val)
         y_pred_test = clf.predict(X_test)
+        # Get probabilities for AUC if available
+        try:
+            y_proba_val = clf.predict_proba(X_val)
+            y_proba_test = clf.predict_proba(X_test)
+        except:
+            y_proba_val = None
+            y_proba_test = None
 
     # ---- Neural Network (single-hidden-layer MLP, PyTorch) ----
     elif model_name == "mlp":
@@ -301,23 +661,51 @@ def train_and_eval(
         num_features = X_train_t.shape[1]
         num_classes = len(label_order)
 
+        # Read MLP config or use defaults
+        mlp_cfg = mlp_config or {}
+        hidden_dims = mlp_cfg.get("hidden_dims", [128])
+        dropout = mlp_cfg.get("dropout", 0.2)
+        activation = mlp_cfg.get("activation", "relu")
+        batch_norm = mlp_cfg.get("batch_norm", False)
+        batch_size = mlp_cfg.get("batch_size", 1024)
+        epochs = mlp_cfg.get("epochs", 10)
+        lr = mlp_cfg.get("lr", 1e-3)
+        weight_decay = mlp_cfg.get("weight_decay", 0.0)
+        lr_schedule = mlp_cfg.get("lr_schedule", "none")
+        early_stopping = mlp_cfg.get("early_stopping", {})
+        es_enabled = early_stopping.get("enabled", False)
+        es_patience = early_stopping.get("patience", 5)
+        es_min_delta = early_stopping.get("min_delta", 0.001)
+
+        # Build activation function
+        if activation == "gelu":
+            act_fn = nn.GELU()
+        elif activation == "swish":
+            act_fn = nn.SiLU()  # SiLU is Swish
+        else:
+            act_fn = nn.ReLU()
+
         class MLP(nn.Module):
-            def __init__(self, in_dim, hidden_dim, out_dim):
+            def __init__(self, in_dim, hidden_dims, out_dim, dropout, activation, batch_norm):
                 super().__init__()
-                self.net = nn.Sequential(
-                    nn.Linear(in_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(hidden_dim, out_dim),
-                )
+                layers = []
+                prev_dim = in_dim
+                for hidden_dim in hidden_dims:
+                    layers.append(nn.Linear(prev_dim, hidden_dim))
+                    if batch_norm:
+                        layers.append(nn.BatchNorm1d(hidden_dim))
+                    layers.append(activation)
+                    layers.append(nn.Dropout(dropout))
+                    prev_dim = hidden_dim
+                layers.append(nn.Linear(prev_dim, out_dim))
+                self.net = nn.Sequential(*layers)
 
             def forward(self, x):
                 return self.net(x)
 
-        model = MLP(num_features, hidden_dim=128, out_dim=num_classes).to(device)
+        model = MLP(num_features, hidden_dims, num_classes, dropout, act_fn, batch_norm).to(device)
 
-        # Dataloaders
-        batch_size = 1024
+        # Dataloaders - using standard shuffling (balanced_sampling disabled for balanced datasets)
         train_ds = TensorDataset(X_train_t, y_train_t)
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
@@ -327,10 +715,32 @@ def train_and_eval(
         y_test_t = y_test_t.to(device)
 
         weights = class_weight_tensor.to(device) if class_weight_tensor is not None else None
-        criterion = nn.CrossEntropyLoss(weight=weights)
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        # Support focal loss if gamma is provided
+        if focal_loss_gamma is not None and focal_loss_gamma > 0:
+            criterion = FocalLoss(alpha=weights, gamma=focal_loss_gamma)
+            loss_type = "focal"
+        else:
+            criterion = nn.CrossEntropyLoss(weight=weights)
+            loss_type = "cross_entropy"
+        
+        # Optimizer
+        if weight_decay > 0:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        
+        # Learning rate scheduler
+        if lr_schedule == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+        elif lr_schedule == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        else:
+            scheduler = None
 
-        epochs = 10
+        # Early stopping
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
 
         t0 = time.time()
         model.train()
@@ -348,6 +758,33 @@ def train_and_eval(
                 epoch_loss += loss.item() * xb.size(0)
 
             avg_loss = epoch_loss / len(train_ds)
+            
+            # Validation loss for early stopping
+            if es_enabled:
+                model.eval()
+                with torch.no_grad():
+                    val_logits = model(X_val_t)
+                    val_loss = criterion(val_logits, y_val_t).item()
+                model.train()
+                
+                if val_loss < best_val_loss - es_min_delta:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    best_model_state = model.state_dict().copy()
+                else:
+                    patience_counter += 1
+                    if patience_counter >= es_patience:
+                        print(f"[mlp] Early stopping at epoch {epoch+1}")
+                        model.load_state_dict(best_model_state)
+                        break
+            
+            # Learning rate scheduling
+            if scheduler:
+                if lr_schedule == "plateau":
+                    scheduler.step(avg_loss)
+                else:
+                    scheduler.step()
+            
             print(f"[mlp] Epoch {epoch+1}/{epochs} - loss={avg_loss:.4f}")
 
         train_time = time.time() - t0
@@ -357,6 +794,8 @@ def train_and_eval(
         with torch.no_grad():
             logits_val = model(X_val_t)
             logits_test = model(X_test_t)
+            y_proba_val = torch.softmax(logits_val, dim=1).cpu().numpy()
+            y_proba_test = torch.softmax(logits_test, dim=1).cpu().numpy()
             y_pred_val_idx = torch.argmax(logits_val, dim=1).cpu().numpy()
             y_pred_test_idx = torch.argmax(logits_test, dim=1).cpu().numpy()
             y_pred_val = label_order[y_pred_val_idx]
@@ -364,13 +803,29 @@ def train_and_eval(
 
         params = {
             "type": "torch_mlp",
-            "hidden_dim": 128,
+            "hidden_dims": hidden_dims,
+            "dropout": dropout,
+            "activation": activation,
+            "batch_norm": batch_norm,
             "batch_size": batch_size,
             "epochs": epochs,
-            "lr": 1e-3,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "lr_schedule": lr_schedule,
+            "early_stopping": early_stopping,
             "device": str(device),
+            "loss": loss_type,
+            "focal_gamma": focal_loss_gamma if focal_loss_gamma else None,
             "class_weights": weights.cpu().numpy().tolist() if weights is not None else None,
         }
+        
+        # Cleanup: delete dense arrays and tensors
+        del X_train_dense, X_val_dense, X_test_dense
+        del X_train_t, X_val_t, X_test_t, y_train_t, y_val_t, y_test_t
+        del model, optimizer, train_loader, train_ds
+        if scheduler is not None:
+            del scheduler
+        _cleanup_memory()
 
     # ---- Two-Layer Feed-Forward Neural Network (PyTorch) ----
     elif model_name == "ffnn":
@@ -419,9 +874,11 @@ def train_and_eval(
             out_dim=num_classes,
         ).to(device)
 
-        # Dataloaders
+        # Dataloaders with balanced sampling if enabled
         batch_size = 1024
         train_ds = TensorDataset(X_train_t, y_train_t)
+        # For FFNN, balanced sampling can be enabled via config if needed
+        # For now, use standard shuffling
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
         X_val_t = X_val_t.to(device)
@@ -430,7 +887,13 @@ def train_and_eval(
         y_test_t = y_test_t.to(device)
 
         weights = class_weight_tensor.to(device) if class_weight_tensor is not None else None
-        criterion = nn.CrossEntropyLoss(weight=weights)
+        # Support focal loss if gamma is provided
+        if focal_loss_gamma is not None and focal_loss_gamma > 0:
+            criterion = FocalLoss(alpha=weights, gamma=focal_loss_gamma)
+            loss_type = "focal"
+        else:
+            criterion = nn.CrossEntropyLoss(weight=weights)
+            loss_type = "cross_entropy"
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
         epochs = 15
@@ -460,6 +923,8 @@ def train_and_eval(
         with torch.no_grad():
             logits_val = model(X_val_t)
             logits_test = model(X_test_t)
+            y_proba_val = torch.softmax(logits_val, dim=1).cpu().numpy()
+            y_proba_test = torch.softmax(logits_test, dim=1).cpu().numpy()
             y_pred_val_idx = torch.argmax(logits_val, dim=1).cpu().numpy()
             y_pred_test_idx = torch.argmax(logits_test, dim=1).cpu().numpy()
             y_pred_val = label_order[y_pred_val_idx]
@@ -473,15 +938,25 @@ def train_and_eval(
             "lr": 1e-3,
             "weight_decay": 1e-4,
             "device": str(device),
+            "loss": loss_type,
+            "focal_gamma": focal_loss_gamma if focal_loss_gamma else None,
             "class_weights": weights.cpu().numpy().tolist() if weights is not None else None,
         }
+        
+        # Cleanup: delete dense arrays and tensors
+        del X_train_dense, X_val_dense, X_test_dense
+        del X_train_t, X_val_t, X_test_t, y_train_t, y_val_t, y_test_t
+        del model, optimizer, train_loader, train_ds
+        _cleanup_memory()
 
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
 
     # ---- Common metrics ----
-    metrics_val, cm_val = build_metric_payload(y_val, y_pred_val, label_order)
-    metrics_test, cm_test = build_metric_payload(y_test, y_pred_test, label_order)
+    # Get probabilities if available (for AUC computation)
+    # Note: y_proba_val and y_proba_test are set in each model branch above
+    metrics_val, cm_val = build_metric_payload(y_val, y_pred_val, label_order, locals().get('y_proba_val', None), cost_matrix)
+    metrics_test, cm_test = build_metric_payload(y_test, y_pred_test, label_order, locals().get('y_proba_test', None), cost_matrix)
 
     report_val = {
         "model": model_name,
@@ -570,8 +1045,10 @@ def main():
     metrics_dir = _ensure_dir(Path(args.reports_dir) / "metrics")
     preds_dir = _ensure_dir(Path(args.reports_dir) / "predictions")
 
-    # Optional: capture split strategy from config
+    # Optional: capture split strategy and class weight config from config
     split_info = {}
+    class_weight_strategy = "inverse_freq"
+    focal_loss_gamma = None
     try:
         cfg = yaml.safe_load(Path(args.config).read_text())
         split_info = {
@@ -579,14 +1056,50 @@ def main():
             "val_size": float(cfg.get("val_size", 0.15)),
             "stratify": bool(cfg.get("stratify", True)),
         }
+        # Read class weight config
+        class_weights_cfg = cfg.get("class_weights", {})
+        class_weight_strategy = class_weights_cfg.get("strategy", "inverse_freq")
+        focal_loss_gamma = class_weights_cfg.get("focal_loss_gamma")
+        if focal_loss_gamma is not None:
+            focal_loss_gamma = float(focal_loss_gamma)
+        # Read logreg config
+        logreg_cfg = cfg.get("logreg", {})
+        logreg_solver = logreg_cfg.get("solver", "auto")
+        logreg_max_iter = int(logreg_cfg.get("max_iter", 1000))
+        logreg_tol = float(logreg_cfg.get("tol", 1e-4))
+        # Read hyperparameter tuning config
+        tuning_cfg = cfg.get("hyperparameter_tuning", {})
+        linearsvc_tuning = tuning_cfg.get("linearsvc", {})
+        tune_linearsvc = linearsvc_tuning.get("enabled", False)
+        linearsvc_cv_folds = linearsvc_tuning.get("cv_folds", 3)
+        rf_tuning = tuning_cfg.get("rf", {})
+        tune_rf = rf_tuning.get("enabled", False)
+        rf_n_iter = rf_tuning.get("n_iter", 20)
+        rf_cv_folds = rf_tuning.get("cv_folds", 3)
+        # Read MLP config
+        mlp_config = cfg.get("mlp", {})
+        # Read cost matrix config
+        cost_cfg = cfg.get("cost_matrix", {})
+        cost_matrix = None
+        if cost_cfg.get("enabled", False):
+            cost_matrix = np.array(cost_cfg.get("matrix", []))
     except Exception:
-        pass
+        logreg_solver = "auto"
+        logreg_max_iter = 1000
+        logreg_tol = 1e-4
+        tune_linearsvc = False
+        linearsvc_cv_folds = 3
+        tune_rf = False
+        rf_n_iter = 20
+        rf_cv_folds = 3
+        mlp_config = {}
+        cost_matrix = None
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     cw = None if (args.class_weight is None or args.class_weight.lower() == "none") else args.class_weight
 
     label_order = np.unique(np.concatenate([y_train, y_val, y_test]))
-    class_weight_tensor = compute_class_weights(y_train, label_order=label_order)
+    class_weight_tensor = compute_class_weights(y_train, label_order=label_order, strategy=class_weight_strategy)
 
     summary_rows = []
 
@@ -605,7 +1118,23 @@ def main():
             linear_class_weight=cw if m in {"logreg", "linearsvc"} else None,
             class_weight_tensor=torch_weights,
             label_order=label_order,
+            focal_loss_gamma=focal_loss_gamma,
+            logreg_solver=logreg_solver if m == "logreg" else "auto",
+            logreg_max_iter=logreg_max_iter if m == "logreg" else 1000,
+            logreg_tol=logreg_tol if m == "logreg" else 1e-4,
+            tune_linearsvc=tune_linearsvc if m == "linearsvc" else False,
+            linearsvc_cv_folds=linearsvc_cv_folds if m == "linearsvc" else 3,
+            tune_rf=tune_rf if m == "rf" else False,
+            rf_n_iter=rf_n_iter if m == "rf" else 20,
+            rf_cv_folds=rf_cv_folds if m == "rf" else 3,
+            mlp_config=mlp_config if m == "mlp" else None,
+            cost_matrix=cost_matrix,
         )
+        
+        # Cleanup memory after each model
+        if m in {"logreg", "mlp", "ffnn"}:
+            _cleanup_memory()
+        
         report_val["split_info"] = split_info
         report_test["split_info"] = split_info
 
@@ -641,7 +1170,12 @@ def main():
                 "model": m,
                 "split": "val",
                 "accuracy": report_val["metrics"]["accuracy"],
+                "balanced_accuracy": report_val["metrics"].get("balanced_accuracy", None),
                 "macro_f1": report_val["metrics"]["macro_f1"],
+                "cohens_kappa": report_val["metrics"].get("cohens_kappa", None),
+                "mcc": report_val["metrics"].get("matthews_corrcoef", None),
+                "class_1_f1": next((p["f1"] for p in report_val["metrics"]["per_class"] if p["class"] == 1), None),
+                "class_4_f1": next((p["f1"] for p in report_val["metrics"]["per_class"] if p["class"] == 4), None),
                 "metrics_json": str(metrics_val_path),
                 "cm_png": str(cm_val_path),
                 "predictions_csv": "",
@@ -652,7 +1186,12 @@ def main():
                 "model": m,
                 "split": "test",
                 "accuracy": report_test["metrics"]["accuracy"],
+                "balanced_accuracy": report_test["metrics"].get("balanced_accuracy", None),
                 "macro_f1": report_test["metrics"]["macro_f1"],
+                "cohens_kappa": report_test["metrics"].get("cohens_kappa", None),
+                "mcc": report_test["metrics"].get("matthews_corrcoef", None),
+                "class_1_f1": next((p["f1"] for p in report_test["metrics"]["per_class"] if p["class"] == 1), None),
+                "class_4_f1": next((p["f1"] for p in report_test["metrics"]["per_class"] if p["class"] == 4), None),
                 "metrics_json": str(metrics_test_path),
                 "cm_png": str(cm_test_path),
                 "predictions_csv": str(preds_path),
