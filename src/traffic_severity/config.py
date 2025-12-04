@@ -33,20 +33,11 @@ class PreprocessConfig(BaseModel):
     scale_numeric: bool = True
     ohe_min_freq: int = 0
 
-    use_arrow: bool = True
     n_jobs: int = -1
-
-    # Resampling configuration
-    resampling: Optional[Dict] = Field(default_factory=lambda: {
-        "method": None,
-        "k_neighbors": 5,
-        "apply_to": "train_only"
-    })
 
     # Data sampling configuration
     data_sampling: Optional[Dict] = Field(default_factory=lambda: {
-        "minority_oversample": False,
-        "majority_sample_fraction": 1.0
+        "minority_oversample": False
     })
 
     # Class merging configuration

@@ -15,7 +15,6 @@ def save_json(obj: Dict[str, Any], path: str | Path) -> None:
 
 def read_csv_fast(
     path: str | Path, 
-    use_arrow: bool = True, 
     n_rows: Optional[int] = None,
     target_col: Optional[str] = None,
     samples_per_class: Optional[Dict[int, int]] = None,
@@ -32,7 +31,6 @@ def read_csv_fast(
     
     Args:
         path: Path to CSV file
-        use_arrow: Whether to use arrow (currently not used, kept for compatibility)
         n_rows: Maximum number of rows to return (ignored if samples_per_class is set)
         target_col: Name of target column for filtering
         samples_per_class: Dict mapping class value -> target count (e.g., {1: 30000, 2: 30000, 3: 30000, 4: 30000})
@@ -180,9 +178,6 @@ def read_csv_fast(
         print(f"[read_csv] Class distribution: {result[target_col].value_counts().sort_index().to_dict()}")
     
     return result
-
-def to_parquet(df: pd.DataFrame, path: str | Path) -> None:
-    df.to_parquet(path, index=False)
 
 def to_csv_series(y: Iterable, path: str | Path) -> None:
     pd.Series(y).to_csv(path, index=False, header=False)
