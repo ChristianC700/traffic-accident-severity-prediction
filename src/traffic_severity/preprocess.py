@@ -17,8 +17,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from .config import PreprocessConfig
-from .utils import ensure_dir, read_csv_fast, save_json, to_parquet, to_csv_series
-from .resample import apply_resampling
+from .utils import ensure_dir, read_csv_fast, save_json, to_csv_series
 
 @dataclass
 class DatasetSplits:
@@ -178,28 +177,6 @@ def fit_transform_and_save(
     X_train_tf = transformer.fit_transform(splits.X_train)
     X_val_tf = transformer.transform(splits.X_val)
     X_test_tf = transformer.transform(splits.X_test)
-    
-    # Apply resampling to training set only if configured
-    # NOTE: Resampling is typically disabled for balanced datasets (method: null in config)
-    # With balanced class sampling (30k per class), SMOTE/ADASYN are unnecessary
-    resampling_cfg = cfg.resampling or {}
-    resampling_method = resampling_cfg.get("method")
-    if resampling_method:
-        k_neighbors = resampling_cfg.get("k_neighbors", 5)
-        n_jobs = cfg.n_jobs
-        sampling_strategy = resampling_cfg.get("sampling_strategy", "auto")
-        print(f"[resample] Applying {resampling_method} to training set...")
-        X_train_tf, y_train_resampled = apply_resampling(
-            X_train_tf,
-            splits.y_train,
-            method=resampling_method,
-            k_neighbors=k_neighbors,
-            random_state=cfg.random_state,
-            n_jobs=n_jobs,
-            sampling_strategy=sampling_strategy,
-        )
-        splits.y_train = y_train_resampled
-        print(f"[resample] Training set size after resampling: {X_train_tf.shape[0]} samples")
 
     # Feature names
     feature_names: List[str] = []
@@ -238,12 +215,11 @@ def fit_transform_and_save(
     joblib.dump(transformer, out_paths["pipeline"])
     save_json({"feature_names": feature_names}, out_paths["features"])
     
-    # Include resampling and class merging info in metadata
+    # Include class merging info in metadata
     meta_data = {
         "created_at": datetime.utcnow().isoformat(),
         "rows": {"train": int(len(splits.y_train)), "val": int(splits.X_val.shape[0]), "test": int(splits.X_test.shape[0])},
         "X_artifacts": meta_x,
-        "resampling": resampling_cfg,
         "merge_classes": cfg.merge_classes or {},
     }
     save_json(meta_data, out_paths["meta"])
@@ -264,7 +240,6 @@ def run_preprocess(config_path: str | Path) -> None:
         # This stops early once all class targets are met
         df = read_csv_fast(
             cfg.raw_csv_path,
-            use_arrow=cfg.use_arrow,
             n_rows=None,  # Ignored when samples_per_class is set
             target_col=cfg.target_column,
             samples_per_class=samples_per_class,
@@ -274,7 +249,6 @@ def run_preprocess(config_path: str | Path) -> None:
         # Legacy behavior: collect all minority classes (for backward compatibility)
         df = read_csv_fast(
             cfg.raw_csv_path,
-            use_arrow=cfg.use_arrow,
             n_rows=None,
             target_col=cfg.target_column,
             minority_classes=[1, 4],  # Collect all samples of these classes
@@ -293,7 +267,7 @@ def run_preprocess(config_path: str | Path) -> None:
     else:
         # Original behavior: simple random sampling
         n_rows = cfg.sample_n_rows if cfg.sample_n_rows else None
-        df = read_csv_fast(cfg.raw_csv_path, use_arrow=cfg.use_arrow, n_rows=n_rows)
+        df = read_csv_fast(cfg.raw_csv_path, n_rows=n_rows)
     
     if cfg.sample_fraction is not None:
         df = df.sample(frac=cfg.sample_fraction, random_state=cfg.random_state)

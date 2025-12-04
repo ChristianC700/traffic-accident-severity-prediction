@@ -46,7 +46,6 @@ sample_fraction: null
 data_sampling:
   minority_oversample: true  # Enable balanced class sampling
   samples_per_class: {1: 30000, 2: 30000, 3: 30000, 4: 30000}  # Target count per class (stops early when met)
-  majority_sample_fraction: 1.0  # Legacy parameter (not used when samples_per_class is set)
 
 
 # Split
@@ -59,16 +58,7 @@ scale_numeric: false       # avoids dense scaling
 ohe_min_freq: 20           # bucket rare categories; reduces OHE width
 
 # IO/perf
-use_arrow: true
 n_jobs: -1
-
-# Resampling (applied to training set only)
-# DISABLED: Dataset is already balanced (30k per class), so resampling is unnecessary
-resampling:
-  method: null  # null, "smote", "adasyn", "borderline_smote" - set to null for balanced datasets
-  k_neighbors: 3
-  apply_to: "train_only"
-  sampling_strategy: "auto"  # "auto", "minority", float (e.g., 0.5), or dict (e.g., {1: 50000, 4: 50000} for target counts)
 
 # Class merging
 merge_classes:

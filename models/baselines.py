@@ -322,7 +322,6 @@ def train_and_eval(
     class_weight_tensor: torch.Tensor | None,
     label_order: np.ndarray | None,
     focal_loss_gamma: float | None = None,
-    logreg_solver: str = "auto",
     logreg_max_iter: int = 1000,
     logreg_tol: float = 1e-4,
     tune_linearsvc: bool = False,
@@ -1064,7 +1063,6 @@ def main():
             focal_loss_gamma = float(focal_loss_gamma)
         # Read logreg config
         logreg_cfg = cfg.get("logreg", {})
-        logreg_solver = logreg_cfg.get("solver", "auto")
         logreg_max_iter = int(logreg_cfg.get("max_iter", 1000))
         logreg_tol = float(logreg_cfg.get("tol", 1e-4))
         # Read hyperparameter tuning config
@@ -1084,7 +1082,6 @@ def main():
         if cost_cfg.get("enabled", False):
             cost_matrix = np.array(cost_cfg.get("matrix", []))
     except Exception:
-        logreg_solver = "auto"
         logreg_max_iter = 1000
         logreg_tol = 1e-4
         tune_linearsvc = False
@@ -1119,7 +1116,6 @@ def main():
             class_weight_tensor=torch_weights,
             label_order=label_order,
             focal_loss_gamma=focal_loss_gamma,
-            logreg_solver=logreg_solver if m == "logreg" else "auto",
             logreg_max_iter=logreg_max_iter if m == "logreg" else 1000,
             logreg_tol=logreg_tol if m == "logreg" else 1e-4,
             tune_linearsvc=tune_linearsvc if m == "linearsvc" else False,
